@@ -1,0 +1,4 @@
+# Ignore build artifacts, logs, and generated data
+build/
+data/
+logs/
