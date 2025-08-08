@@ -1,6 +1,5 @@
 // examples/addition.cpp - Minimal benchmark for homomorphic addition
 #include <openfhe.h>
-#include <dram_counter.hpp>
 #include "utils.hpp"
 #include <iostream>
 #include <vector>
@@ -13,9 +12,6 @@
 
 using namespace lbcrypto;
 
-// Global DRAM counter
-static DRAMCounter g_dram_counter;
-
 int main(int argc, char* argv[]) {
     // Parse command-line arguments
     ArgParser parser;
@@ -26,17 +22,24 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     
-    // Initialize DRAM counter
-    if (!g_dram_counter.init()) {
-        std::cerr << "Warning: DRAM measurements disabled (try sudo)\n";
-    }
+    // Setup measurement system
+    MeasurementMode mode = parser.getMeasurementMode();
+    bool quiet = parser.getBool("quiet", false);
+    bool skipVerify = parser.getBool("skip-verify", false);
+    
+    MeasurementSystem measurement(mode, quiet);
+    measurement.initialize();
 
     // ============================================
     // SETUP: Configure CKKS parameters
     // ============================================
     
     BenchmarkParams params = BenchmarkParams::fromArgs(parser);
-    params.print();
+    
+    if (!quiet) {
+        params.print();
+        std::cout << "Measurement mode: " << measurement.getModeString() << "\n\n";
+    }
     
     CCParams<CryptoContextCKKSRNS> ccParams;
     ccParams.SetMultiplicativeDepth(params.multDepth);
@@ -55,7 +58,9 @@ int main(int argc, char* argv[]) {
     cc->Enable(KEYSWITCH);
     cc->Enable(LEVELEDSHE);
 
-    std::cout << "=== Addition Benchmark ===" << std::endl;
+    if (!quiet) {
+        std::cout << "=== Addition Benchmark ===" << std::endl;
+    }
 
     // Generate key pair
     auto keyPair = cc->KeyGen();
@@ -71,8 +76,10 @@ int main(int argc, char* argv[]) {
     Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(vec1);
     Plaintext ptxt2 = cc->MakeCKKSPackedPlaintext(vec2);
     
-    std::cout << "Input 1: " << ptxt1 << std::endl;
-    std::cout << "Input 2: " << ptxt2 << std::endl;
+    if (!quiet) {
+        std::cout << "Input 1: " << ptxt1 << std::endl;
+        std::cout << "Input 2: " << ptxt2 << std::endl;
+    }
 
     // Encrypt
     auto cipher1 = cc->Encrypt(keyPair.publicKey, ptxt1);
@@ -84,8 +91,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Serialize ciphertexts explicitly (keeping it clear what's happening)
-    std::cout << "Serializing input ciphertexts..." << std::endl;
+    // Serialize ciphertexts
+    if (!quiet) {
+        std::cout << "Serializing input ciphertexts..." << std::endl;
+    }
     
     std::string cipher1Path = tempDir.getFilePath("cipher1.bin");
     std::string cipher2Path = tempDir.getFilePath("cipher2.bin");
@@ -101,7 +110,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    std::cout << "Serialization complete\n" << std::endl;
+    if (!quiet) {
+        std::cout << "Serialization complete\n" << std::endl;
+        std::cout << "Starting profiled addition...\n" << std::endl;
+    }
 
     // Clear ciphertexts from memory to ensure we're loading from disk
     cipher1.reset();
@@ -111,10 +123,8 @@ int main(int argc, char* argv[]) {
     // PROFILED COMPUTATION
     // ============================================
     
-    std::cout << "Starting profiled addition...\n" << std::endl;
-
-    // Start DRAM traffic measurement
-    g_dram_counter.start();
+    // Start DRAM measurement (includes I/O)
+    measurement.startDRAM();
 
     // Load input ciphertexts from disk
     Ciphertext<DCRTPoly> c1Loaded, c2Loaded;
@@ -129,14 +139,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // Start integer operation counting (PIN will count between these markers)
-    PIN_MARKER_START();
+    // PIN markers directly around ONLY the FHE operation
+    if (mode == MeasurementMode::PIN_ONLY || mode == MeasurementMode::ALL) {
+        PIN_MARKER_START();
+    }
     
     // Perform addition - the actual FHE operation!
     auto cipherResult = cc->EvalAdd(c1Loaded, c2Loaded);
     
-    // Stop integer operation counting
-    PIN_MARKER_END();
+    if (mode == MeasurementMode::PIN_ONLY || mode == MeasurementMode::ALL) {
+        PIN_MARKER_END();
+    }
         
     // Serialize result
     if (!Serial::SerializeToFile(resultPath, cipherResult, SerType::BINARY)) {
@@ -144,46 +157,34 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // Stop DRAM traffic measurement
-    g_dram_counter.stop();
+    // Stop DRAM measurement
+    measurement.stopDRAM();
     
-    // Print DRAM results (saves to logs/dram_counts.out)
-    g_dram_counter.print_results();
-    
-    // ============================================
-    // COLLECT AND PRINT PROFILING METRICS
-    // ============================================
-    
-    ProfilingResults results;
-    results.calculate();  // Reads from logs/int_counts.out and logs/dram_counts.out
-    
-    // Print for Python parsing
-    results.printForPython();
-    
-    // Also print human-readable
-    results.printHuman();
+    // Print measurement results
+    measurement.printResults();
     
     // ============================================
     // VERIFICATION: Decrypt and check result
     // ============================================
     
-    std::cout << "\nDecrypting result..." << std::endl;
-    
-    Plaintext result;
-    cc->Decrypt(keyPair.secretKey, cipherResult, &result);
-    result->SetLength(vec1.size());
-    
-    std::cout.precision(8);
-    std::cout << "Result: " << result << std::endl;
-    
-    // Show expected values
-    std::cout << "Expected: (";
-    for (size_t i = 0; i < vec1.size(); i++) {
-        std::cout << vec1[i] + vec2[i];
-        if (i < vec1.size() - 1) std::cout << ", ";
+    if (!quiet && !skipVerify) {
+        std::cout << "\nDecrypting result..." << std::endl;
+        
+        Plaintext result;
+        cc->Decrypt(keyPair.secretKey, cipherResult, &result);
+        result->SetLength(vec1.size());
+        
+        std::cout.precision(8);
+        std::cout << "Result: " << result << std::endl;
+        
+        // Show expected values
+        std::cout << "Expected: (";
+        for (size_t i = 0; i < vec1.size(); i++) {
+            std::cout << vec1[i] + vec2[i];
+            if (i < vec1.size() - 1) std::cout << ", ";
+        }
+        std::cout << ")" << std::endl;
     }
-    std::cout << ")" << std::endl;
     
-    // TempDirectory automatically cleaned up here
     return 0;
 }
