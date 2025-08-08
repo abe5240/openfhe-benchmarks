@@ -53,9 +53,8 @@ int main() {
 
     std::cout << "=== Addition Benchmark ===" << std::endl;
 
-    // Generate key pair (only need public key for encryption and secret for verification)
+    // Generate key pair
     auto keyPair = cc->KeyGen();
-    // Note: No EvalMultKeyGen or EvalRotateKeyGen needed for addition!
 
     // ============================================
     // CREATE AND SERIALIZE INPUT CIPHERTEXTS
@@ -91,7 +90,7 @@ int main() {
     std::cout << "Serialization complete\n" << std::endl;
 
     // Clear ciphertexts from memory to ensure we're loading from disk
-    //cipher1.reset();
+    cipher1.reset();
     cipher2.reset();
 
     // ============================================
@@ -100,49 +99,36 @@ int main() {
     
     std::cout << "Starting profiled addition...\n" << std::endl;
 
-
-    volatile uint64_t* a = new uint64_t(3);   // load value = 3
-    volatile uint64_t* b = new uint64_t(5);   // load value = 5
-    volatile uint64_t* c = new uint64_t(0);   // destination
-
-
     // Start DRAM traffic measurement (includes all I/O and computation)
     g_dram_counter.start();
 
     // Load input ciphertexts from disk
-    // if (!Serial::DeserializeFromFile("data/cipher1.bin", c1Loaded, SerType::BINARY)) {
-    //     std::cerr << "Failed to load ciphertext 1" << std::endl;
-    //     return 1;
-    // }
+    Ciphertext<DCRTPoly> c1Loaded, c2Loaded;
+    
+    if (!Serial::DeserializeFromFile("data/cipher1.bin", c1Loaded, SerType::BINARY)) {
+        std::cerr << "Failed to load ciphertext 1" << std::endl;
+        return 1;
+    }
 
-    //Ciphertext<DCRTPoly> c1Loaded = cipher1->Clone(); // , c2Loaded;
-
-
-    // if (!Serial::DeserializeFromFile("data/cipher2.bin", c2Loaded, SerType::BINARY)) {
-    //     std::cerr << "Failed to load ciphertext 2" << std::endl;
-    //     return 1;
-    // }
+    if (!Serial::DeserializeFromFile("data/cipher2.bin", c2Loaded, SerType::BINARY)) {
+        std::cerr << "Failed to load ciphertext 2" << std::endl;
+        return 1;
+    }
     
     // Start integer operation counting
     PIN_MARKER_START();
-
-
-    *c = *a + *b;   
-    //int* arr3 = new int[10000]();
     
     // Perform addition (no key switching needed!)
-    //Ciphertext cipherResult; /// = cc->EvalAdd(c1Loaded, c2Loaded);
+    auto cipherResult = cc->EvalAdd(c1Loaded, c2Loaded);
     
     // Stop integer operation counting
     PIN_MARKER_END();
-    
-    delete a; delete b; delete c;
-    
+        
     // Serialize and save output ciphertext
-    // if (!Serial::SerializeToFile("data/result.bin", cipherResult, SerType::BINARY)) {
-    //     std::cerr << "Failed to save result ciphertext" << std::endl;
-    //     return 1;
-    // }
+    if (!Serial::SerializeToFile("data/result.bin", cipherResult, SerType::BINARY)) {
+        std::cerr << "Failed to save result ciphertext" << std::endl;
+        return 1;
+    }
     
     // Stop DRAM traffic measurement
     g_dram_counter.stop();
@@ -154,22 +140,22 @@ int main() {
     // VERIFICATION: Decrypt and check result
     // ============================================
     
-    // std::cout << "\nDecrypting result..." << std::endl;
+    std::cout << "\nDecrypting result..." << std::endl;
     
-    // Plaintext result;
-    // cc->Decrypt(keyPair.secretKey, cipherResult, &result);
-    // result->SetLength(vec1.size());
+    Plaintext result;
+    cc->Decrypt(keyPair.secretKey, cipherResult, &result);
+    result->SetLength(vec1.size());
     
-    // std::cout.precision(8);
-    // std::cout << "Result: " << result << std::endl;
+    std::cout.precision(8);
+    std::cout << "Result: " << result << std::endl;
     
-    // // Show expected values
-    // std::cout << "Expected: (";
-    // for (size_t i = 0; i < vec1.size(); i++) {
-    //     std::cout << vec1[i] + vec2[i];
-    //     if (i < vec1.size() - 1) std::cout << ", ";
-    // }
-    // std::cout << ")" << std::endl;
+    // Show expected values
+    std::cout << "Expected: (";
+    for (size_t i = 0; i < vec1.size(); i++) {
+        std::cout << vec1[i] + vec2[i];
+        if (i < vec1.size() - 1) std::cout << ", ";
+    }
+    std::cout << ")" << std::endl;
     
     return 0;
 }

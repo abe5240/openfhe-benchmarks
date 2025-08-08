@@ -1,80 +1,81 @@
-// examples/single-hoisted-bsgs-diagonal-method.cpp
-// Single-hoisted BSGS with n1 = pow2_ceil(sqrt(#nonzero_diagonals)),
-// n2 = ceil(numSlots / n1) (informational), and skipping empty giant blocks.
-
+// examples/single-hoisted-bsgs-diagonal-method.cpp - Hoisted BSGS diagonal method for matrix-vector multiplication
 #include <openfhe.h>
 #include <dram_counter.hpp>
 #include "utils.hpp"
-
-#include <algorithm>
-#include <cmath>
-#include <fstream>
 #include <iostream>
+#include <iomanip>
+#include <vector>
+#include <fstream>
+#include <algorithm>
 #include <map>
 #include <set>
 #include <sstream>
-#include <vector>
+#include <cmath>
 
+// Headers needed for serialization
 #include <ciphertext-ser.h>
 #include <cryptocontext-ser.h>
 #include <key/key-ser.h>
 #include <scheme/ckksrns/ckksrns-ser.h>
 
+extern "C" {
+    void __attribute__((noinline)) PIN_MARKER_START() { 
+        asm volatile(""); 
+    }
+    void __attribute__((noinline)) PIN_MARKER_END() { 
+        asm volatile("");
+    }
+}
+
 using namespace lbcrypto;
 
-// ----- PIN markers -----
-extern "C" {
-void __attribute__((noinline)) PIN_MARKER_START() { asm volatile(""); }
-void __attribute__((noinline)) PIN_MARKER_END()   { asm volatile(""); }
-}
-
-// ----- DRAM counter -----
+// Global DRAM counter
 static DRAMCounter g_dram_counter;
 
-// ---------- helpers ----------
-static inline int floordiv(int a, int b) {
-    int q = a / b, r = a % b;
-    if (r && ((a < 0) != (b < 0))) --q;
-    return q;
+// ============================================
+// HELPER FUNCTIONS FOR SIGNED INDEXING
+// ============================================
+
+// Convert diagonal index from [0, slots-1] to signed range [-slots/2, slots/2]
+// This treats the second half of slots as negative indices
+// Example: in 64 slots, index 63 becomes -1 (one step backwards)
+int normalizeToSignedIndex(int k, int numSlots) {
+    int halfSlots = numSlots / 2;
+    if (k <= halfSlots) {
+        return k;  // First half stays positive
+    } else {
+        return k - numSlots;  // Second half becomes negative
+    }
 }
-static inline int normalize_signed_k(int k, int slots) {
-    int half = slots / 2;
-    return (k <= half) ? k : k - slots;
-}
-static void gen_and_save_rotkey(const CryptoContext<DCRTPoly>& cc,
-                                const PrivateKey<DCRTPoly>& sk,
-                                int rot, const std::string& path) {
-    cc->EvalRotateKeyGen(sk, {rot});
-    std::ofstream f(path, std::ios::binary);
-    if (!cc->SerializeEvalAutomorphismKey(f, SerType::BINARY))
-        throw std::runtime_error("Serialize rotkey " + std::to_string(rot));
-    f.close();
-    cc->ClearEvalAutomorphismKeys();
-}
-static void load_rotkey(const CryptoContext<DCRTPoly>& cc,
-                        int rot, const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!cc->DeserializeEvalAutomorphismKey(f, SerType::BINARY))
-        throw std::runtime_error("Deserialize rotkey " + std::to_string(rot));
-    f.close();
-}
-static inline int pow2_ceil(double x) {
-    if (x <= 1.0) return 1;
-    int p = 1;
-    while (p < (int)std::ceil(x)) p <<= 1;
-    return p;
+
+// Floor division that works correctly for negative numbers
+// Regular C++ division truncates toward zero, but we need true floor division
+// Example: -5 / 3 = -2 (floor), not -1 (truncation)
+int floorDivision(int a, int b) {
+    int quotient = a / b;
+    int remainder = a % b;
+    // Adjust if remainder is nonzero and signs differ
+    if (remainder != 0 && ((a < 0) != (b < 0))) {
+        quotient--;
+    }
+    return quotient;
 }
 
 int main() {
-    if (!g_dram_counter.init())
+    // Initialize DRAM counter
+    if (!g_dram_counter.init()) {
         std::cerr << "Warning: DRAM measurements disabled\n";
+    }
 
-    // ---- CKKS params (example) ----
+    // ============================================
+    // SETUP: Configure CKKS parameters
+    // ============================================
+    
     uint32_t numLimbs     = 10;
     uint32_t numDigits    = 2;
     uint32_t scaleModSize = 50;
-    uint32_t ringDim      = 65536;     // large slot count vs matrix
-    std::size_t matrixDim = 1024;
+    uint32_t ringDim      = 65536; 
+    std::size_t matrixDim = 128;  // Actual matrix dimension
 
     CCParams<CryptoContextCKKSRNS> params;
     params.SetMultiplicativeDepth(numLimbs - 1);
@@ -85,152 +86,330 @@ int main() {
     params.SetNumLargeDigits(numDigits);
     params.SetSecurityLevel(HEStd_NotSet);
 
-    auto cc = GenCryptoContext(params);
+    // Create cryptocontext
+    CryptoContext<DCRTPoly> cc = GenCryptoContext(params);
     cc->Enable(PKE);
     cc->Enable(KEYSWITCH);
     cc->Enable(LEVELEDSHE);
 
-    const int slots = (int)cc->GetEncodingParams()->GetBatchSize();
-    if ((int)matrixDim > slots) {
-        std::cerr << "matrixDim must be <= slots\n";
+    int numSlots = static_cast<int>(cc->GetEncodingParams()->GetBatchSize());
+    if (static_cast<int>(matrixDim) > numSlots) {
+        std::cerr << "Error: matrixDim must be <= numSlots\n";
         return 1;
     }
+    
+    std::cout << "=== Single-Hoisted BSGS Method with On-Demand Key Loading ===\n";
+    std::cout << "Actual matrix dimension: " << matrixDim << "×" << matrixDim << "\n";
+    std::cout << "Number of slots: " << numSlots << "\n";
+    std::cout << "Ring dimension: " << ringDim << "\n\n";
 
-    std::cout << "=== Single-Hoisted BSGS (Diagonal) ===\n";
-    std::cout << "matrixDim=" << matrixDim << "  slots=" << slots
-              << "  ringDim=" << ringDim << "\n";
-
-    auto kp = cc->KeyGen();
-
-    auto M = make_embedded_random_matrix(matrixDim, slots);
-    auto v = make_random_input_vector(matrixDim, slots);
+    // Generate key pair
+    auto keyPair = cc->KeyGen();
+    
+    // ============================================
+    // CREATE MATRIX AND VECTOR
+    // ============================================
+    
+    // Create embedded random matrix
+    auto M = make_embedded_random_matrix(matrixDim, numSlots);
     print_matrix(M, matrixDim);
+    
+    // Create random input vector
+    auto inputVec = make_random_input_vector(matrixDim, numSlots);
 
-    // ---- extract diagonals ----
-    auto diags_raw = extract_generalized_diagonals(M, matrixDim);
-    std::cout << "non-empty diagonals: " << diags_raw.size() << "\n";
-
-    // map to signed k
-    std::map<int, std::vector<double>> diags_signed;
-    for (const auto& kv : diags_raw) {
-        int k_signed = normalize_signed_k(kv.first, slots);
-        diags_signed[k_signed] = kv.second;
+    // ============================================
+    // EXTRACT DIAGONALS AND CONVERT TO SIGNED INDEXING
+    // ============================================
+    
+    std::cout << "Extracting diagonals...\n";
+    
+    // First extract diagonals with regular indexing [0, numSlots-1]
+    auto diagonalsUnsigned = extract_generalized_diagonals(M, matrixDim);
+    
+    // Convert to signed indexing [-numSlots/2, numSlots/2]
+    // This allows us to treat the slot ring symmetrically
+    std::map<int, std::vector<double>> diagonalsSigned;
+    
+    for (const auto& entry : diagonalsUnsigned) {
+        int kUnsigned = entry.first;
+        int kSigned = normalizeToSignedIndex(kUnsigned, numSlots);
+        diagonalsSigned[kSigned] = entry.second;
     }
-    const std::size_t D = diags_signed.size();      // ≈ 2*matrixDim-1
-
-    // ---- your rule: n1 = pow2_ceil(sqrt(D)); n2 = ceil(slots/n1) ----
-    int n1 = pow2_ceil(std::sqrt((double)D));
-    if (n1 > slots) n1 = slots;
-    if (n1 < 1)     n1 = 1;
-    int n2 = (int)std::ceil((double)slots / n1);    // informational
-    std::cout << "chosen n1=" << n1 << " (pow2 ceil sqrt(D)), n2≈" << n2 << "\n";
-
-    // ---- pre-shift + encode ----
-    std::map<int, Plaintext> encDiag; // key = signed k
-    std::set<int> usedResidues;       // i in [0, n1)
-    std::set<int> usedJ;              // j may be negative
-
-    for (const auto& kv : diags_signed) {
-        int k = kv.first;                  // signed
-        int j = floordiv(k, n1);
-        int i = k - j * n1;                // 0..n1-1
-
-        usedResidues.insert(i);
-        usedJ.insert(j);
-
-        auto shifted = rotateVectorDown(kv.second, (n1 * j) % slots);
-        encDiag[k] = cc->MakeCKKSPackedPlaintext(shifted);
+    
+    int numDiagonals = static_cast<int>(diagonalsSigned.size());
+    std::cout << "Found " << numDiagonals << " non-empty diagonals\n";
+    std::cout << "Diagonal indices range from " << diagonalsSigned.begin()->first 
+              << " to " << diagonalsSigned.rbegin()->first << "\n";
+    
+    // ============================================
+    // BSGS PARAMETERS BASED ON ACTUAL DIAGONAL COUNT
+    // ============================================
+    
+    // Choose n1 based on the actual number of diagonals (not numSlots!)
+    // This is much more efficient for sparse matrices
+    int n1 = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(numDiagonals))));
+    
+    // Ensure n1 is reasonable
+    if (n1 < 1) n1 = 1;
+    if (n1 > numSlots) n1 = numSlots;
+    
+    // n2 is informational - we don't actually need it as a fixed bound
+    int n2_approx = static_cast<int>(std::ceil(static_cast<double>(numSlots) / n1));
+    
+    std::cout << "BSGS parameters: n1 = " << n1 
+              << " (based on sqrt(" << numDiagonals << ")), n2 ≈ " << n2_approx << "\n";
+    
+    // ============================================
+    // DECOMPOSE DIAGONALS AND PRE-SHIFT
+    // ============================================
+    
+    std::cout << "Pre-shifting diagonals for BSGS decomposition...\n";
+    
+    // Track which baby steps (i) and giant steps (j) we actually use
+    std::set<int> usedBabySteps;   // i ∈ [0, n1)
+    std::set<int> usedGiantSteps;  // j can be negative!
+    
+    // Pre-shift each diagonal by its giant step amount
+    std::map<int, Plaintext> preshiftedDiagonals;
+    
+    for (const auto& entry : diagonalsSigned) {
+        int k = entry.first;  // Signed diagonal index
+        
+        // Decompose k = j*n1 + i where i ∈ [0, n1)
+        // Use floor division to handle negative k correctly
+        int j = floorDivision(k, n1);
+        int i = k - j * n1;  // This ensures i ∈ [0, n1) even for negative k
+        
+        usedBabySteps.insert(i);
+        usedGiantSteps.insert(j);
+        
+        // Pre-shift the diagonal by j*n1 positions
+        auto diagonal = entry.second;
+        int shiftAmount = (n1 * j) % numSlots;
+        if (shiftAmount < 0) shiftAmount += numSlots;  // Ensure positive shift
+        diagonal = rotateVectorDown(diagonal, shiftAmount);
+        
+        // Store with original signed key k
+        preshiftedDiagonals[k] = cc->MakeCKKSPackedPlaintext(diagonal);
     }
-
-    // ---- rotation keys: baby (i>0) and giant (j!=0) that actually occur ----
-    std::set<int> rotIdx;
-    for (int i : usedResidues) if (i != 0) rotIdx.insert(i);
-    for (int j : usedJ) {
-        int r = n1 * j; if (r != 0) rotIdx.insert(r);
+    
+    std::cout << "Baby steps used: " << usedBabySteps.size() 
+              << ", Giant steps used: " << usedGiantSteps.size() << "\n";
+    std::cout << "Giant step range: [" << *usedGiantSteps.begin() 
+              << ", " << *usedGiantSteps.rbegin() << "]\n";
+    
+    // ============================================
+    // GENERATE AND SAVE ROTATION KEYS INDIVIDUALLY
+    // ============================================
+    
+    std::cout << "Generating and saving rotation keys individually...\n";
+    
+    // Collect all needed rotations
+    std::set<int> rotationIndices;
+    
+    // Baby rotations (skip i=0 which is identity)
+    for (int i : usedBabySteps) {
+        if (i != 0) rotationIndices.insert(i);
     }
-    std::cout << "generating " << rotIdx.size() << " rotation keys...\n";
-    for (int r : rotIdx) {
-        gen_and_save_rotkey(cc, kp.secretKey, r, "data/rot_key_" + std::to_string(r) + ".bin");
+    
+    // Giant rotations (can be negative!)
+    for (int j : usedGiantSteps) {
+        if (j != 0) {
+            int rotation = n1 * j;
+            rotationIndices.insert(rotation);
+        }
     }
+    
+    // Generate and save each rotation key separately
+    for (int rot : rotationIndices) {
+        cc->EvalRotateKeyGen(keyPair.secretKey, {rot});
+        
+        std::stringstream filename;
+        filename << "data/hoisted-bsgs-rot-key-" << rot << ".bin";
+        
+        std::ofstream keyFile(filename.str(), std::ios::binary);
+        if (!cc->SerializeEvalAutomorphismKey(keyFile, SerType::BINARY)) {
+            std::cerr << "Failed to save rotation key " << rot << "\n";
+            return 1;
+        }
+        keyFile.close();
+        cc->ClearEvalAutomorphismKeys();
+    }
+    
+    std::cout << "Generated and saved " << rotationIndices.size() << " rotation keys\n";
+    
+    // ============================================
+    // ENCRYPT AND SERIALIZE INPUT
+    // ============================================
+    
+    std::cout << "Encrypting and serializing input...\n";
+    
+    Plaintext inputPtxt = cc->MakeCKKSPackedPlaintext(inputVec);
+    auto inputCipher = cc->Encrypt(keyPair.publicKey, inputPtxt);
+    
+    if (!Serial::SerializeToFile("data/input.bin", inputCipher, SerType::BINARY)) {
+        std::cerr << "Failed to serialize input\n";
+        return 1;
+    }
+    
+    inputCipher.reset();
 
-    // ---- encrypt & serialize input ----
-    auto ctIn = cc->Encrypt(kp.publicKey, cc->MakeCKKSPackedPlaintext(v));
-    Serial::SerializeToFile("data/input.bin", ctIn, SerType::BINARY);
-    ctIn.reset();
-
-    // ---- reload & hoist ----
-    Ciphertext<DCRTPoly> in;
-    Serial::DeserializeFromFile("data/input.bin", in, SerType::BINARY);
-
-    std::cout << "\nStarting profiled hoisted BSGS compute...\n";
+    // ============================================
+    // PROFILED HOISTED BSGS COMPUTATION WITH ON-DEMAND KEY LOADING
+    // ============================================
+    
+    std::cout << "\nStarting profiled hoisted BSGS computation with on-demand key loading...\n\n";
+    
     g_dram_counter.start();
-    PIN_MARKER_START();
-
-    auto pre = cc->EvalFastRotationPrecompute(in);
-    const uint32_t cyclo = 2 * cc->GetRingDimension();
-
-    // cache baby rotations on-demand
-    std::vector<Ciphertext<DCRTPoly>> baby(n1);
-    std::vector<bool> haveBaby(n1, false);
-    baby[0] = in; haveBaby[0] = true;
-
-    auto getBaby = [&](int i) -> Ciphertext<DCRTPoly> {
-        if (!haveBaby[i]) {
-            std::string path = "data/rot_key_" + std::to_string(i) + ".bin";
-            load_rotkey(cc, i, path);
-            baby[i] = cc->EvalFastRotation(in, i, cyclo, pre);
-            cc->ClearEvalAutomorphismKeys();
-            haveBaby[i] = true;
-        }
-        return baby[i];
-    };
-
-    // iterate only actually-used giant blocks (skips the gaps automatically)
-    std::vector<int> jList(usedJ.begin(), usedJ.end());
-    std::sort(jList.begin(), jList.end());
-
-    Ciphertext<DCRTPoly> result;
-    bool haveResult = false;
-
-    for (int j : jList) {
-        Ciphertext<DCRTPoly> block;
-        bool haveBlock = false;
-
-        for (int i = 0; i < n1; ++i) {
-            int k = j * n1 + i;
-            auto it = encDiag.find(k);
-            if (it == encDiag.end()) continue; // whole n1-chunk empty → skipped
-
-            auto ctB = (i == 0) ? baby[0] : getBaby(i);
-            auto prod = cc->EvalMult(ctB, it->second);
-            block = haveBlock ? cc->EvalAdd(block, prod) : (haveBlock = true, prod);
-        }
-
-        if (!haveBlock) continue;
-
-        int rot = n1 * j;
-        if (rot != 0) {
-            std::string path = "data/rot_key_" + std::to_string(rot) + ".bin";
-            load_rotkey(cc, rot, path);
-            block = cc->EvalRotate(block, rot);
-            cc->ClearEvalAutomorphismKeys();
-        }
-
-        result = haveResult ? cc->EvalAdd(result, block) : (haveResult = true, block);
+    
+    // Load input ciphertext
+    Ciphertext<DCRTPoly> cipherInput;
+    if (!Serial::DeserializeFromFile("data/input.bin", cipherInput, SerType::BINARY)) {
+        std::cerr << "Failed to load input\n";
+        return 1;
     }
-
+    
+    PIN_MARKER_START();
+    
+    // === SINGLE-HOISTED BSGS WITH ON-DEMAND KEY LOADING ===
+    
+    // Step 1: Precompute rotation digits once (hoisting optimization)
+    // This is the key hoisting step - shared by all baby rotations
+    std::cout << "Precomputing rotation digits for hoisting...\n";
+    auto precomputedDigits = cc->EvalFastRotationPrecompute(cipherInput);
+    
+    // Step 2: Get cyclotomic order (needed by EvalFastRotation)
+    uint32_t cyclotomicOrder = 2 * cc->GetRingDimension();
+    
+    // Step 3: Cache for baby rotations with on-demand computation
+    std::vector<Ciphertext<DCRTPoly>> babyRotationCache(n1);
+    std::vector<bool> babyRotationComputed(n1, false);
+    
+    // Identity rotation is always available
+    babyRotationCache[0] = cipherInput;
+    babyRotationComputed[0] = true;
+    
+    // Helper lambda to get/compute baby rotation with hoisting
+    auto getHoistedBabyRotation = [&](int i) -> const Ciphertext<DCRTPoly>& {
+        if (!babyRotationComputed[i]) {
+            // Load rotation key for this baby step
+            std::stringstream filename;
+            filename << "data/hoisted-bsgs-rot-key-" << i << ".bin";
+            
+            std::ifstream keyFile(filename.str(), std::ios::binary);
+            if (!cc->DeserializeEvalAutomorphismKey(keyFile, SerType::BINARY)) {
+                std::cerr << "Failed to load key for baby step " << i << "\n";
+                throw std::runtime_error("Missing rotation key");
+            }
+            keyFile.close();
+            
+            // Compute rotation using hoisting (fast rotation with precomputed digits)
+            babyRotationCache[i] = cc->EvalFastRotation(cipherInput, i, cyclotomicOrder, precomputedDigits);
+            
+            // Clear the key immediately after use
+            cc->ClearEvalAutomorphismKeys();
+            babyRotationComputed[i] = true;
+        }
+        return babyRotationCache[i];
+    };
+    
+    // Step 4: Process giant steps in sorted order
+    std::vector<int> sortedGiantSteps(usedGiantSteps.begin(), usedGiantSteps.end());
+    std::sort(sortedGiantSteps.begin(), sortedGiantSteps.end());
+    
+    Ciphertext<DCRTPoly> result;
+    bool first = true;
+    
+    for (int j : sortedGiantSteps) {
+        
+        // Accumulate all baby steps for this giant block
+        Ciphertext<DCRTPoly> giantBlockSum;
+        bool giantBlockFirst = true;
+        
+        // Check all possible baby steps for this giant block
+        for (int i = 0; i < n1; ++i) {
+            // Reconstruct the signed diagonal index
+            int k = j * n1 + i;
+            
+            // Check if this diagonal exists
+            auto diagIter = preshiftedDiagonals.find(k);
+            if (diagIter == preshiftedDiagonals.end()) continue;
+            
+            // Get baby rotation (identity or compute with hoisting)
+            const auto& babyRotated = (i == 0) ? cipherInput : getHoistedBabyRotation(i);
+            
+            // Multiply with pre-shifted diagonal
+            auto partial = cc->EvalMult(babyRotated, diagIter->second);
+            
+            // Accumulate within giant block
+            if (giantBlockFirst) {
+                giantBlockSum = partial;
+                giantBlockFirst = false;
+            } else {
+                giantBlockSum = cc->EvalAdd(giantBlockSum, partial);
+            }
+        }
+        
+        // Skip if block is empty (shouldn't happen)
+        if (giantBlockFirst) continue;
+        
+        // Apply giant rotation if j ≠ 0 (load key on-demand)
+        if (j != 0) {
+            int giantRotation = n1 * j;  // Can be negative!
+            
+            // Load rotation key for this giant step
+            std::stringstream filename;
+            filename << "data/hoisted-bsgs-rot-key-" << giantRotation << ".bin";
+            
+            std::ifstream keyFile(filename.str(), std::ios::binary);
+            if (!cc->DeserializeEvalAutomorphismKey(keyFile, SerType::BINARY)) {
+                std::cerr << "Failed to load key for giant step " << giantRotation << "\n";
+                return 1;
+            }
+            keyFile.close();
+            
+            // Note: Giant steps use regular rotation (not hoisted)
+            giantBlockSum = cc->EvalRotate(giantBlockSum, giantRotation);
+            
+            // Clear the key immediately after use
+            cc->ClearEvalAutomorphismKeys();
+        }
+        
+        // Add to result
+        if (first) {
+            result = giantBlockSum;
+            first = false;
+        } else {
+            result = cc->EvalAdd(result, giantBlockSum);
+        }
+    }
+    
+    // Final rescale to manage noise
     result = cc->Rescale(result);
-
+    
     PIN_MARKER_END();
+    
+    // Save result
+    if (!Serial::SerializeToFile("data/result.bin", result, SerType::BINARY)) {
+        std::cerr << "Failed to save result\n";
+        return 1;
+    }
+    
     g_dram_counter.stop();
     g_dram_counter.print_results(true);
+    
+    // ============================================
+    // VERIFICATION
+    // ============================================
+    
+    std::cout << "\nDecrypting and verifying result...\n";
+    
+    Plaintext resultPtxt;
+    cc->Decrypt(keyPair.secretKey, result, &resultPtxt);
+    resultPtxt->SetLength(numSlots);
+    
+    auto resultVec = resultPtxt->GetRealPackedValue();
+    verify_matrix_vector_result(resultVec, M, inputVec, matrixDim);
 
-    Serial::SerializeToFile("data/result.bin", result, SerType::BINARY);
-
-    // ---- verify ----
-    Plaintext out;
-    cc->Decrypt(kp.secretKey, result, &out);
-    out->SetLength(slots);
-    verify_matrix_vector_result(out->GetRealPackedValue(), M, v, matrixDim);
     return 0;
 }
