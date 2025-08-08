@@ -1,9 +1,9 @@
 // examples/addition.cpp - Minimal benchmark for homomorphic addition
 #include <openfhe.h>
 #include <dram_counter.hpp>
+#include "utils.hpp"
 #include <iostream>
 #include <vector>
-#include <fstream>
 
 // Headers needed for serialization
 #include <ciphertext-ser.h>
@@ -11,42 +11,46 @@
 #include <key/key-ser.h>
 #include <scheme/ckksrns/ckksrns-ser.h>
 
-extern "C" {
-    void __attribute__((noinline)) PIN_MARKER_START() { 
-        asm volatile(""); 
-    }
-    void __attribute__((noinline)) PIN_MARKER_END() { 
-        asm volatile("");
-    }
-}
-
 using namespace lbcrypto;
 
 // Global DRAM counter
 static DRAMCounter g_dram_counter;
 
-int main() {
+int main(int argc, char* argv[]) {
+    // Parse command-line arguments
+    ArgParser parser;
+    parser.parse(argc, argv);
+    
+    if (parser.hasHelp()) {
+        parser.printUsage("addition");
+        return 0;
+    }
+    
     // Initialize DRAM counter
     if (!g_dram_counter.init()) {
-        std::cerr << "Warning: DRAM measurements disabled\n";
+        std::cerr << "Warning: DRAM measurements disabled (try sudo)\n";
     }
 
     // ============================================
     // SETUP: Configure CKKS parameters
     // ============================================
     
-    uint32_t multDepth    = 19;
-    uint32_t scaleModSize = 50;
-    uint32_t ringDim      = 65536;
+    BenchmarkParams params = BenchmarkParams::fromArgs(parser);
+    params.print();
     
-    CCParams<CryptoContextCKKSRNS> params;
-    params.SetMultiplicativeDepth(multDepth);
-    params.SetScalingModSize(scaleModSize);
-    params.SetRingDim(ringDim);
-    //params.SetSecurityLevel(HEStd_128_classic);
+    CCParams<CryptoContextCKKSRNS> ccParams;
+    ccParams.SetMultiplicativeDepth(params.multDepth);
+    ccParams.SetScalingModSize(params.scaleModSize);
+    ccParams.SetRingDim(params.ringDim);
+    
+    if (params.checkSecurity) {
+        ccParams.SetSecurityLevel(HEStd_128_classic);
+    } else {
+        ccParams.SetSecurityLevel(HEStd_NotSet);
+    }
     
     // Create cryptocontext
-    CryptoContext<DCRTPoly> cc = GenCryptoContext(params);
+    CryptoContext<DCRTPoly> cc = GenCryptoContext(ccParams);
     cc->Enable(PKE);
     cc->Enable(KEYSWITCH);
     cc->Enable(LEVELEDSHE);
@@ -74,15 +78,25 @@ int main() {
     auto cipher1 = cc->Encrypt(keyPair.publicKey, ptxt1);
     auto cipher2 = cc->Encrypt(keyPair.publicKey, ptxt2);
 
-    // Serialize input ciphertexts
+    // Create temporary directory
+    TempDirectory tempDir;
+    if (!tempDir.isValid()) {
+        return 1;
+    }
+
+    // Serialize ciphertexts explicitly (keeping it clear what's happening)
     std::cout << "Serializing input ciphertexts..." << std::endl;
     
-    if (!Serial::SerializeToFile("data/cipher1.bin", cipher1, SerType::BINARY)) {
+    std::string cipher1Path = tempDir.getFilePath("cipher1.bin");
+    std::string cipher2Path = tempDir.getFilePath("cipher2.bin");
+    std::string resultPath = tempDir.getFilePath("result.bin");
+    
+    if (!Serial::SerializeToFile(cipher1Path, cipher1, SerType::BINARY)) {
         std::cerr << "Failed to serialize ciphertext 1" << std::endl;
         return 1;
     }
     
-    if (!Serial::SerializeToFile("data/cipher2.bin", cipher2, SerType::BINARY)) {
+    if (!Serial::SerializeToFile(cipher2Path, cipher2, SerType::BINARY)) {
         std::cerr << "Failed to serialize ciphertext 2" << std::endl;
         return 1;
     }
@@ -99,33 +113,33 @@ int main() {
     
     std::cout << "Starting profiled addition...\n" << std::endl;
 
-    // Start DRAM traffic measurement (includes all I/O and computation)
+    // Start DRAM traffic measurement
     g_dram_counter.start();
 
     // Load input ciphertexts from disk
     Ciphertext<DCRTPoly> c1Loaded, c2Loaded;
     
-    if (!Serial::DeserializeFromFile("data/cipher1.bin", c1Loaded, SerType::BINARY)) {
+    if (!Serial::DeserializeFromFile(cipher1Path, c1Loaded, SerType::BINARY)) {
         std::cerr << "Failed to load ciphertext 1" << std::endl;
         return 1;
     }
 
-    if (!Serial::DeserializeFromFile("data/cipher2.bin", c2Loaded, SerType::BINARY)) {
+    if (!Serial::DeserializeFromFile(cipher2Path, c2Loaded, SerType::BINARY)) {
         std::cerr << "Failed to load ciphertext 2" << std::endl;
         return 1;
     }
     
-    // Start integer operation counting
+    // Start integer operation counting (PIN will count between these markers)
     PIN_MARKER_START();
     
-    // Perform addition (no key switching needed!)
+    // Perform addition - the actual FHE operation!
     auto cipherResult = cc->EvalAdd(c1Loaded, c2Loaded);
     
     // Stop integer operation counting
     PIN_MARKER_END();
         
-    // Serialize and save output ciphertext
-    if (!Serial::SerializeToFile("data/result.bin", cipherResult, SerType::BINARY)) {
+    // Serialize result
+    if (!Serial::SerializeToFile(resultPath, cipherResult, SerType::BINARY)) {
         std::cerr << "Failed to save result ciphertext" << std::endl;
         return 1;
     }
@@ -133,8 +147,21 @@ int main() {
     // Stop DRAM traffic measurement
     g_dram_counter.stop();
     
-    // Print DRAM results
-    g_dram_counter.print_results(true);
+    // Print DRAM results (saves to logs/dram_counts.out)
+    g_dram_counter.print_results();
+    
+    // ============================================
+    // COLLECT AND PRINT PROFILING METRICS
+    // ============================================
+    
+    ProfilingResults results;
+    results.calculate();  // Reads from logs/int_counts.out and logs/dram_counts.out
+    
+    // Print for Python parsing
+    results.printForPython();
+    
+    // Also print human-readable
+    results.printHuman();
     
     // ============================================
     // VERIFICATION: Decrypt and check result
@@ -157,5 +184,6 @@ int main() {
     }
     std::cout << ")" << std::endl;
     
+    // TempDirectory automatically cleaned up here
     return 0;
 }

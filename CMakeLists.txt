@@ -18,7 +18,7 @@ include_directories(
     ${OpenFHE_INCLUDE}/core
     ${OpenFHE_INCLUDE}/pke
     ${OpenFHE_INCLUDE}/binfhe
-    /opt/intel/pin/profiling-tools        # dram_counter.hpp
+    /opt/profiling-tools/include      # System-installed dram_counter.hpp
 )
 
 # ── Benchmark source selection (exactly one) ────────────────────────────────
