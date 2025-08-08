@@ -7,7 +7,8 @@
 #include <vector>
 #include <fstream>
 #include <algorithm>
-#include <unordered_map>
+#include <map>
+#include <sstream>
 
 // Headers needed for serialization
 #include <ciphertext-ser.h>
@@ -80,20 +81,8 @@ int main() {
     
     // Create embedded random matrix
     auto M = make_embedded_random_matrix(matrixDim, numSlots);
+    auto inputVec = make_random_input_vector(matrixDim, numSlots);
     print_matrix(M, matrixDim);
-    
-    // Create input vector (only first matrixDim elements are meaningful)
-    std::vector<double> inputVec(numSlots, 0.0);
-    for (std::size_t i = 0; i < matrixDim; ++i) {
-        inputVec[i] = 0.1 * (i + 1);  // Simple test values
-    }
-    
-    std::cout << "\nInput vector (first " << std::min(matrixDim, std::size_t(10)) << " elements): ";
-    for (std::size_t i = 0; i < matrixDim && i < 10; ++i) {
-        std::cout << inputVec[i] << " ";
-    }
-    if (matrixDim > 10) std::cout << "...";
-    std::cout << "\n\n";
 
     // ============================================
     // EXTRACT AND ENCODE ALL NON-EMPTY DIAGONALS
@@ -105,21 +94,45 @@ int main() {
     auto diagonals = extract_generalized_diagonals(M, matrixDim);
     std::cout << "Found " << diagonals.size() << " non-empty diagonals\n";
     
-    // Generate rotation keys only for the diagonals we actually need
+    // Generate and serialize rotation keys individually
     // k=0 doesn't need rotation, so we skip it
     std::vector<int32_t> rotationIndices;
-    for (const auto& [k, _] : diagonals) {
+    for (const auto& entry : diagonals) {
+        int k = entry.first;
         if (k != 0) {
             rotationIndices.push_back(k);
         }
     }
     
-    cc->EvalRotateKeyGen(keyPair.secretKey, rotationIndices);
-    std::cout << "Generated rotation keys for " << rotationIndices.size() << " rotations\n";
+    std::cout << "Generating and saving " << rotationIndices.size() << " rotation keys individually...\n";
+    
+    // Generate and save each rotation key separately
+    for (int32_t k : rotationIndices) {
+        // Generate key for this specific rotation
+        cc->EvalRotateKeyGen(keyPair.secretKey, {k});
+        
+        // Save with descriptive filename: rotation-key-k{value}.bin
+        std::stringstream filename;
+        filename << "data/rotation-key-k" << k << ".bin";
+        
+        std::ofstream keyFile(filename.str(), std::ios::binary);
+        if (!cc->SerializeEvalAutomorphismKey(keyFile, SerType::BINARY)) {
+            std::cerr << "Failed to serialize rotation key for k=" << k << "\n";
+            return 1;
+        }
+        keyFile.close();
+        
+        // Clear the key from memory immediately after saving
+        cc->ClearEvalAutomorphismKeys();
+    }
+    
+    std::cout << "Saved " << rotationIndices.size() << " rotation key files\n";
     
     // Encode diagonals as plaintexts
-    std::unordered_map<int, Plaintext> diagonalPlaintexts;
-    for (const auto& [k, diag] : diagonals) {
+    std::map<int, Plaintext> diagonalPlaintexts;
+    for (const auto& entry : diagonals) {
+        int k = entry.first;
+        const auto& diag = entry.second;
         diagonalPlaintexts[k] = cc->MakeCKKSPackedPlaintext(diag);
     }
     
@@ -128,41 +141,26 @@ int main() {
     auto inputCipher = cc->Encrypt(keyPair.publicKey, inputPtxt);
 
     // ============================================
-    // SERIALIZE
+    // SERIALIZE INPUT
     // ============================================
     
-    std::cout << "Serializing keys and input...\n";
-    
-    std::ofstream rotKeyFile("data/rotation-keys.bin", std::ios::binary);
-    if (!cc->SerializeEvalAutomorphismKey(rotKeyFile, SerType::BINARY)) {
-        std::cerr << "Failed to serialize rotation keys\n";
-        return 1;
-    }
-    rotKeyFile.close();
+    std::cout << "Serializing input...\n";
     
     if (!Serial::SerializeToFile("data/input.bin", inputCipher, SerType::BINARY)) {
         std::cerr << "Failed to serialize input\n";
         return 1;
     }
     
-    cc->ClearEvalAutomorphismKeys();
     inputCipher.reset();
 
     // ============================================
     // PROFILED DIAGONAL METHOD COMPUTATION
     // ============================================
     
-    std::cout << "\nStarting profiled computation...\n\n";
+    std::cout << "\nStarting profiled computation...\n";
+    std::cout << "Loading rotation keys on-demand during computation...\n\n";
     
     g_dram_counter.start();
-    
-    // Load keys
-    std::ifstream rotKeyIn("data/rotation-keys.bin", std::ios::binary);
-    if (!cc->DeserializeEvalAutomorphismKey(rotKeyIn, SerType::BINARY)) {
-        std::cerr << "Failed to load rotation keys\n";
-        return 1;
-    }
-    rotKeyIn.close();
     
     // Load input
     Ciphertext<DCRTPoly> cipherInput;
@@ -173,21 +171,39 @@ int main() {
     
     PIN_MARKER_START();
     
-    // === SIMPLIFIED DIAGONAL METHOD ===
+    // === SIMPLIFIED DIAGONAL METHOD WITH ON-DEMAND KEY LOADING ===
     // Compute: result = sum_k diag_k * rotate(input, k)
-    // where k ranges over all non-empty diagonals (all positive indices!)
+    // Loading each rotation key only when needed
     
     Ciphertext<DCRTPoly> result;
     bool first = true;
 
     // Process all non-empty diagonals
-    for (const auto& [k, _] : diagonals) {
+    for (const auto& entry : diagonals) {
+        int k = entry.first;
+        
         Ciphertext<DCRTPoly> rotated;
         
         if (k == 0) {
-            rotated = cipherInput;  // No rotation for main diagonal
+            // No rotation needed for main diagonal
+            rotated = cipherInput;
         } else {
-            rotated = cc->EvalRotate(cipherInput, k);  // All rotations use positive k!
+            // Load the specific rotation key for this k value
+            std::stringstream filename;
+            filename << "data/rotation-key-k" << k << ".bin";
+            
+            std::ifstream keyFile(filename.str(), std::ios::binary);
+            if (!cc->DeserializeEvalAutomorphismKey(keyFile, SerType::BINARY)) {
+                std::cerr << "Failed to load rotation key for k=" << k << "\n";
+                return 1;
+            }
+            keyFile.close();
+            
+            // Perform rotation with the loaded key
+            rotated = cc->EvalRotate(cipherInput, k);
+            
+            // Clear the key from memory after use
+            cc->ClearEvalAutomorphismKeys();
         }
         
         // Multiply by k-th diagonal

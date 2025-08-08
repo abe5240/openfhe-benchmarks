@@ -1,4 +1,4 @@
-// examples/single-hoisted-diagonal-method.cpp - Hoisted diagonal method for matrix-vector multiplication
+// examples/single-hoisted-diagonal-method.cpp - Hoisted rotation diagonal method for matrix-vector multiplication
 #include <openfhe.h>
 #include <dram_counter.hpp>
 #include "utils.hpp"
@@ -6,7 +6,9 @@
 #include <iomanip>
 #include <vector>
 #include <fstream>
-#include <unordered_map>
+#include <algorithm>
+#include <map>
+#include <sstream>
 
 // Headers needed for serialization
 #include <ciphertext-ser.h>
@@ -38,20 +40,20 @@ int main() {
     // SETUP: Configure CKKS parameters
     // ============================================
     
-    uint32_t numLimbs     = 15;
-    uint32_t numDigits    = 1;
+    uint32_t numLimbs     = 10;
+    uint32_t numDigits    = 2;
     uint32_t scaleModSize = 50;
-    uint32_t ringDim      = 65536; 
-    std::size_t matrixDim = 128;  // Actual matrix dimension
+    uint32_t ringDim      = 128; 
+    std::size_t matrixDim = 16;  // Actual matrix dimension
 
     CCParams<CryptoContextCKKSRNS> params;
     params.SetMultiplicativeDepth(numLimbs - 1);
     params.SetScalingModSize(scaleModSize);
     params.SetRingDim(ringDim);
-    params.SetScalingTechnique(FLEXIBLEAUTO);
+    params.SetScalingTechnique(FIXEDMANUAL);
     params.SetKeySwitchTechnique(HYBRID);
     params.SetNumLargeDigits(numDigits);
-    params.SetSecurityLevel(HEStd_128_classic);
+    params.SetSecurityLevel(HEStd_NotSet);
 
     // Create cryptocontext
     CryptoContext<DCRTPoly> cc = GenCryptoContext(params);
@@ -79,89 +81,91 @@ int main() {
     
     // Create embedded random matrix
     auto M = make_embedded_random_matrix(matrixDim, numSlots);
+    auto inputVec = make_random_input_vector(matrixDim, numSlots);
     print_matrix(M, matrixDim);
-    
-    // Create input vector (only first matrixDim elements are meaningful)
-    std::vector<double> inputVec(numSlots, 0.0);
-    for (std::size_t i = 0; i < matrixDim; ++i) {
-        inputVec[i] = 0.1 * (i + 1);  // Simple test values
-    }
-    
-    std::cout << "\nInput vector (first " << std::min(matrixDim, std::size_t(10)) << " elements): ";
-    for (std::size_t i = 0; i < matrixDim && i < 10; ++i) {
-        std::cout << inputVec[i] << " ";
-    }
-    if (matrixDim > 10) std::cout << "...";
-    std::cout << "\n\n";
 
     // ============================================
-    // EXTRACT AND ENCODE NON-EMPTY DIAGONALS
+    // EXTRACT AND ENCODE ALL NON-EMPTY DIAGONALS
     // ============================================
     
     std::cout << "Extracting diagonals...\n";
     
-    // Extract all non-empty diagonals (using positive indices only!)
+    // Extract all non-empty diagonals
     auto diagonals = extract_generalized_diagonals(M, matrixDim);
     std::cout << "Found " << diagonals.size() << " non-empty diagonals\n";
     
-    // Generate rotation keys only for the diagonals we actually need
-    // k=0 doesn't need rotation, so we skip it
-    std::vector<int32_t> rotationIndices;
-    for (const auto& [k, _] : diagonals) {
+    // Build parallel vectors for efficient access during computation
+    // rotationIndexList[i] corresponds to diagonalPlaintextList[i]
+    std::vector<int32_t> rotationIndexList;
+    std::vector<Plaintext> diagonalPlaintextList;
+    
+    rotationIndexList.reserve(diagonals.size());
+    diagonalPlaintextList.reserve(diagonals.size());
+    
+    // Also track which rotations we actually need (skip k=0)
+    std::vector<int32_t> rotationsNeeded;
+    
+    for (const auto& entry : diagonals) {
+        int k = entry.first;
+        const auto& diag = entry.second;
+        
+        rotationIndexList.push_back(k);
+        diagonalPlaintextList.push_back(cc->MakeCKKSPackedPlaintext(diag));
+        
         if (k != 0) {
-            rotationIndices.push_back(k);
+            rotationsNeeded.push_back(k);
         }
     }
     
-    cc->EvalRotateKeyGen(keyPair.secretKey, rotationIndices);
-    std::cout << "Generated rotation keys for " << rotationIndices.size() << " rotations\n";
+    // Generate and save rotation keys individually
+    std::cout << "Generating and saving " << rotationsNeeded.size() << " rotation keys individually...\n";
     
-    // Encode diagonals as plaintexts
-    std::unordered_map<int, Plaintext> diagonalPlaintexts;
-    for (const auto& [k, diag] : diagonals) {
-        diagonalPlaintexts[k] = cc->MakeCKKSPackedPlaintext(diag);
+    for (int32_t k : rotationsNeeded) {
+        // Generate key for this specific rotation
+        cc->EvalRotateKeyGen(keyPair.secretKey, {k});
+        
+        // Save with descriptive filename: rotation-key-k{value}.bin
+        std::stringstream filename;
+        filename << "data/rotation-key-k" << k << ".bin";
+        
+        std::ofstream keyFile(filename.str(), std::ios::binary);
+        if (!cc->SerializeEvalAutomorphismKey(keyFile, SerType::BINARY)) {
+            std::cerr << "Failed to serialize rotation key for k=" << k << "\n";
+            return 1;
+        }
+        keyFile.close();
+        
+        // Clear the key from memory immediately after saving
+        cc->ClearEvalAutomorphismKeys();
     }
+    
+    std::cout << "Saved " << rotationsNeeded.size() << " rotation key files\n";
     
     // Encrypt input vector
     Plaintext inputPtxt = cc->MakeCKKSPackedPlaintext(inputVec);
     auto inputCipher = cc->Encrypt(keyPair.publicKey, inputPtxt);
 
     // ============================================
-    // SERIALIZE
+    // SERIALIZE INPUT
     // ============================================
     
-    std::cout << "Serializing keys and input...\n";
-    
-    std::ofstream rotKeyFile("data/rotation-keys.bin", std::ios::binary);
-    if (!cc->SerializeEvalAutomorphismKey(rotKeyFile, SerType::BINARY)) {
-        std::cerr << "Failed to serialize rotation keys\n";
-        return 1;
-    }
-    rotKeyFile.close();
+    std::cout << "Serializing input...\n";
     
     if (!Serial::SerializeToFile("data/input.bin", inputCipher, SerType::BINARY)) {
         std::cerr << "Failed to serialize input\n";
         return 1;
     }
     
-    cc->ClearEvalAutomorphismKeys();
     inputCipher.reset();
 
     // ============================================
-    // PROFILED SINGLE-HOISTED COMPUTATION
+    // PROFILED HOISTED DIAGONAL METHOD COMPUTATION
     // ============================================
     
-    std::cout << "\nStarting profiled computation...\n\n";
+    std::cout << "\nStarting profiled computation...\n";
+    std::cout << "Will load rotation keys on-demand during computation...\n\n";
     
     g_dram_counter.start();
-    
-    // Load keys
-    std::ifstream rotKeyIn("data/rotation-keys.bin", std::ios::binary);
-    if (!cc->DeserializeEvalAutomorphismKey(rotKeyIn, SerType::BINARY)) {
-        std::cerr << "Failed to load rotation keys\n";
-        return 1;
-    }
-    rotKeyIn.close();
     
     // Load input
     Ciphertext<DCRTPoly> cipherInput;
@@ -172,82 +176,62 @@ int main() {
     
     PIN_MARKER_START();
     
-    // === SINGLE-HOISTED DIAGONAL METHOD (Lattigo-style) ===
-    // 1. Precompute digit decomposition once (hoisting)
-    // 2. Perform all rotations in extended basis QP
-    // 3. Accumulate everything in QP space (avoiding intermediate mod-downs)
-    // 4. Handle k=0 (no rotation) separately at the end
-    // 5. Single KeySwitchDown from QP to Q at the very end
+    // === SINGLE-HOISTED DIAGONAL METHOD WITH ON-DEMAND KEY LOADING ===
+    // Step 1: Precompute rotation digits once (hoisting optimization)
+    // This allows us to reuse the expensive digit decomposition across all rotations
+    std::cout << "Precomputing rotation digits for hoisting...\n";
+    auto precomputedDigits = cc->EvalFastRotationPrecompute(cipherInput);
     
-    // Step 1: Precompute digit decomposition of the input ciphertext
-    // This is equivalent to Lattigo's GadgetProductHoistedLazy preparation
-    auto digits = cc->EvalFastRotationPrecompute(cipherInput);
+    // Step 2: Get cyclotomic order (needed by EvalFastRotation)
+    uint32_t cyclotomicOrder = 2 * cc->GetRingDimension();
     
-    // Step 2: Separate k=0 from other diagonals (like Lattigo's 'state' variable)
-    bool hasMainDiagonal = (diagonals.find(0) != diagonals.end());
-    std::vector<int> rotationKeys;
-    for (const auto& [k, _] : diagonals) {
-        if (k != 0) {
-            rotationKeys.push_back(k);
-        }
-    }
-    
-    // Step 3: Perform all rotations in extended basis (QP space)
-    // Using vector for thread-safe parallel access
-    std::vector<Ciphertext<DCRTPoly>> rotatedCiphersExt(rotationKeys.size());
-    
-    // Parallel rotation using precomputed digits
-    // The 'false' parameter means we don't compute c0 yet (like Lattigo)
-    #pragma omp parallel for
-    for (size_t i = 0; i < rotationKeys.size(); ++i) {
-        int k = rotationKeys[i];
-        // EvalFastRotationExt keeps result in extended basis QP
-        // addFirst=false means we skip computing c0 for now (efficiency)
-        rotatedCiphersExt[i] = cc->EvalFastRotationExt(cipherInput, k, digits, false);
-    }
-    
-    // Step 4: Multiply by diagonals and accumulate in QP space
-    // This avoids intermediate rescaling/mod-down operations
-    Ciphertext<DCRTPoly> resultQP;
+    // Step 3: Compute result = sum_k diag_k * rotate(input, k)
+    // Using hoisted rotations with on-demand key loading
+    Ciphertext<DCRTPoly> result;
     bool first = true;
     
-    for (size_t i = 0; i < rotationKeys.size(); ++i) {
-        int k = rotationKeys[i];
+    for (std::size_t idx = 0; idx < rotationIndexList.size(); ++idx) {
+        int32_t k = rotationIndexList[idx];
+        const Plaintext& diagonalPtxt = diagonalPlaintextList[idx];
         
-        // Multiply rotated ciphertext by diagonal (stays in QP)
-        // This multiplication happens in the extended basis
-        auto partialQP = cc->EvalMult(rotatedCiphersExt[i], diagonalPlaintexts[k]);
+        Ciphertext<DCRTPoly> rotated;
         
-        // Accumulate in QP space (no mod-down yet!)
+        if (k == 0) {
+            // No rotation needed for main diagonal
+            rotated = cipherInput;
+        } else {
+            // Load the specific rotation key for this k value
+            std::stringstream filename;
+            filename << "data/rotation-key-k" << k << ".bin";
+            
+            std::ifstream keyFile(filename.str(), std::ios::binary);
+            if (!cc->DeserializeEvalAutomorphismKey(keyFile, SerType::BINARY)) {
+                std::cerr << "Failed to load rotation key for k=" << k << "\n";
+                return 1;
+            }
+            keyFile.close();
+            
+            // Use fast rotation with precomputed digits and loaded key
+            rotated = cc->EvalFastRotation(cipherInput, k, cyclotomicOrder, precomputedDigits);
+            
+            // Clear the key from memory after use
+            cc->ClearEvalAutomorphismKeys();
+        }
+        
+        // Multiply by k-th diagonal
+        auto partial = cc->EvalMult(rotated, diagonalPtxt);
+        
+        // Accumulate
         if (first) {
-            resultQP = partialQP;
+            result = partial;
             first = false;
         } else {
-            // EvalAdd in QP space - more efficient than repeated mod-downs
-            resultQP = cc->EvalAdd(resultQP, partialQP);
+            result = cc->EvalAdd(result, partial);
         }
     }
     
-    // Step 5: Now scale down from QP to Q (like Lattigo's ModDownQPtoQNTT)
-    Ciphertext<DCRTPoly> result;
-    if (!first) {
-        // KeySwitchDown scales from extended basis P*Q down to Q
-        result = cc->KeySwitchDown(resultQP);
-    }
-    
-    // Step 6: Handle main diagonal (k=0) separately - no rotation needed
-    // This is done after mod-down, similar to Lattigo's approach
-    if (hasMainDiagonal) {
-        auto mainDiagResult = cc->EvalMult(cipherInput, diagonalPlaintexts[0]);
-        
-        if (first) {
-            // If we only have the main diagonal
-            result = mainDiagResult;
-        } else {
-            // Add to the already mod-downed result
-            result = cc->EvalAdd(result, mainDiagResult);
-        }
-    }
+    // Rescale once at the end to manage noise
+    result = cc->Rescale(result);
     
     PIN_MARKER_END();
     
@@ -271,9 +255,7 @@ int main() {
     resultPtxt->SetLength(numSlots);
     
     auto resultVec = resultPtxt->GetRealPackedValue();
-    
-    // Use the utility function for verification
     verify_matrix_vector_result(resultVec, M, inputVec, matrixDim);
-    
+
     return 0;
 }

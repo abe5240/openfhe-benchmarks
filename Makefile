@@ -19,6 +19,8 @@ $(eval $(call bench,multiplication,multiplication.cpp,multiplication))
 $(eval $(call bench,rotation,rotation.cpp,rotation))
 $(eval $(call bench,simple-diagonal-method,simple-diagonal-method.cpp,simple-diagonal-method))
 $(eval $(call bench,single-hoisted-diagonal-method,single-hoisted-diagonal-method.cpp,single-hoisted-diagonal-method))
+$(eval $(call bench,bsgs-diagonal-method,bsgs-diagonal-method.cpp,bsgs-diagonal-method))
+$(eval $(call bench,single-hoisted-bsgs-diagonal-method,single-hoisted-bsgs-diagonal-method.cpp,single-hoisted-bsgs-diagonal-method))
 
 # housekeeping
 .PHONY: addition \
@@ -26,6 +28,8 @@ $(eval $(call bench,single-hoisted-diagonal-method,single-hoisted-diagonal-metho
         rotation \
         simple-diagonal-method \
         single-hoisted-diagonal-method \
+        bsgs-diagonal-method \
+        single-hoisted-bsgs-diagonal-method \
         clean
 
 clean:
