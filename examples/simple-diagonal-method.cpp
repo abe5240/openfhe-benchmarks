@@ -16,14 +16,6 @@
 #include <key/key-ser.h>
 #include <scheme/ckksrns/ckksrns-ser.h>
 
-extern "C" {
-    void __attribute__((noinline)) PIN_MARKER_START() { 
-        asm volatile(""); 
-    }
-    void __attribute__((noinline)) PIN_MARKER_END() { 
-        asm volatile("");
-    }
-}
 
 using namespace lbcrypto;
 
