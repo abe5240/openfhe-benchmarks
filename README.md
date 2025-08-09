@@ -161,5 +161,4 @@ openfhe-benchmarks/
 └── logs/
     ├── dram_counts.out         # DRAM fallback
     └── int_counts.out          # PIN fallback
-
 ~~~
