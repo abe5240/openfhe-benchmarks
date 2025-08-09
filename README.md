@@ -1,293 +1,177 @@
-# OpenFHE Benchmarks with Arithmetic Intensity Profiling
+# OpenFHE Benchmarks with Arithmetic-Intensity Profiling
 
-A benchmarking suite for OpenFHE (Open Fully Homomorphic Encryption) library that measures arithmetic intensity by combining Intel PIN instrumentation for integer operation counting with hardware performance counters for DRAM traffic measurement.
+Measure FHE efficiency with **three isolated passes** per run:
+1) **Latency only**, 2) **DRAM traffic only**, 3) **Integer-op counts only**.  
+The Python driver auto-builds binaries, runs warm-ups, executes each pass, parses results, and **falls back to log files** if stdout/stderr parsing changes.
 
-## Overview
+---
 
-This project provides tools to measure the computational efficiency of FHE operations by calculating their arithmetic intensity (operations per byte of DRAM traffic). It includes:
+## Requirements
 
-- **Integer operation counting** using Intel PIN dynamic binary instrumentation
-- **DRAM traffic measurement** using hardware performance counters
-- **Configurable FHE parameters** via command-line arguments
-- **Python integration** for parameter sweeps and analysis
-- **Multiple benchmark implementations** (addition, multiplication, matrix operations)
+- Ubuntu 20.04+ (tested on 22.04)
+- Intel CPU with uncore IMC PMU
+- OpenFHE ≥ 1.2.0
+- CMake ≥ 3.5, GCC ≥ 11, Python ≥ 3.8
+- **Passwordless sudo** for perf counters & PIN (**`sudo -n` must work**)
 
-## System Requirements
+---
 
-- Ubuntu 20.04+ (tested on Ubuntu 22.04)
-- Intel CPU with uncore PMU support
-- OpenFHE library installed (v1.2.0+)
-- CMake 3.5.1+
-- GCC 11+
-- Python 3.8+
-- sudo access (for performance counters)
+## Install
 
-## Installation
-
-### 1. Install OpenFHE
-
-```bash
-# Install OpenFHE (if not already installed)
+### 1) Install OpenFHE
+~~~bash
 git clone https://github.com/openfheorg/openfhe-development.git
 cd openfhe-development
 mkdir build && cd build
 cmake ..
-make -j$(nproc)
+make -j"$(nproc)"
 sudo make install
-```
+~~~
 
-### 2. Install Profiling Tools
+### 2) Install profiling tools (PIN + DRAM counter + pintool)
+From this repo:
+~~~bash
+sudo bash install.sh
+# Installs:
+#  - PIN → /opt/intel/pin/
+#  - pintool.so → /opt/profiling-tools/lib/pintool.so
+#  - dram_counter.hpp → /opt/profiling-tools/include/
+~~~
 
-The profiling tools (PIN and DRAM counter) are installed system-wide at `/opt/profiling-tools/`:
+> If you modify `src/pintool.cpp` or `src/dram_counter.hpp`, rerun:
+> ~~~bash
+> sudo bash install.sh
+> ~~~
 
-```bash
-# From the arithmetic-intensity-profiler directory (separate repo)
-sudo ./install_profiling_tools.sh
+---
 
-# This installs:
-# - Intel PIN to /opt/intel/pin/
-# - Custom PIN tool to /opt/profiling-tools/lib/pintool.so
-# - DRAM counter header to /opt/profiling-tools/include/dram_counter.hpp
-```
+## Build the benchmarks
 
-### 3. Build the Benchmarks
+Let Python auto-build, or build manually:
+~~~bash
+mkdir -p build
+cmake -S . -B build -DBENCH_SOURCE=examples/addition.cpp -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+~~~
 
-```bash
-cd openfhe-benchmarks
-mkdir build
-cmake -S . -B build -DBENCH_SOURCE=examples/addition.cpp
-cmake --build build
-```
+---
 
-## Usage
+## Quick start
 
-### Basic Execution
+### One benchmark (auto-builds if needed)
+~~~bash
+python3 benchmark.py addition --ring-dim=8192 --runs=3
+~~~
 
-#### Run without PIN (DRAM measurement only):
-```bash
-sudo ./build/addition --ring-dim=8192 --mult-depth=15
-```
+### Thread sweep
+~~~bash
+python3 benchmark.py multiplication --thread-sweep 1 2 4 8 --ring-dim=8192 --runs=5
+~~~
 
-#### Run with PIN instrumentation:
-```bash
-# Using the convenience wrapper
-sudo /opt/profiling-tools/bin/run-with-pin ./build/addition --ring-dim=8192
+### Parameter sweep
+~~~bash
+python3 benchmark.py rotation --sweep ring-dim 4096 8192 16384 --threads=4 --runs=5
+~~~
 
-# Or directly
-sudo /opt/intel/pin/pin -t /opt/profiling-tools/lib/pintool.so -- \
-    ./build/addition --ring-dim=8192
-```
+### Use a prebuilt executable
+~~~bash
+python3 benchmark.py --exe ./build/addition --ring-dim=8192 --runs=3
+~~~
 
-### Command-line Parameters
+### Save JSON
+~~~bash
+python3 benchmark.py addition --ring-dim=8192 --runs=3 --json results.json
+~~~
 
-All benchmarks support these parameters:
+---
 
-- `--ring-dim=N` - Ring dimension (default: 65536)
-- `--mult-depth=N` - Multiplicative depth (default: 19)
-- `--scale-mod-size=N` - Scaling modulus size (default: 50)
-- `--check-security=BOOL` - Enable security level check (default: false)
-- `--help` - Show usage information
+## How metrics are collected (exact commands)
 
-Example:
-```bash
-sudo ./build/addition --ring-dim=32768 --mult-depth=10 --scale-mod-size=40
-```
+Each metric is measured in a **separate process**; no mixing.
 
-### Python Integration
+- **Latency only**
+  ~~~bash
+  ./build/<bench> ... --measure=none --quiet=true --skip-verify=true
+  ~~~
 
-#### Single run with profiling:
-```python
-from bench_runner import BenchmarkRunner
+- **DRAM only** (machine-readable on stdout; Python is whitespace-tolerant)
+  ~~~bash
+  sudo -n ./build/<bench> ... --measure=dram --quiet=true --skip-verify=true
+  # Emits:
+  # DRAM_READ_BYTES=<u64>
+  # DRAM_WRITE_BYTES=<u64>
+  # DRAM_TOTAL_BYTES=<u64>
+  ~~~
+  If parsing fails, Python falls back to `logs/dram_counts.out`.
 
-runner = BenchmarkRunner(".", use_pin=True)
-result = runner.run("addition", {
-    "ring_dim": 16384,
-    "mult_depth": 15,
-    "scale_mod_size": 45
-})
+- **Integer ops only (PIN)**  
+  Counts ADD/SUB/MUL/DIV between `PIN_MARKER_START/END`.
+  ~~~bash
+  sudo -n /opt/intel/pin/pin -t /opt/profiling-tools/lib/pintool.so -- \
+      ./build/<bench> ... --measure=pin --quiet=true --skip-verify=true
+  # PIN writes human summary to stderr and logs TOTAL to:
+  #   logs/int_counts.out  (line: "TOTAL: <u64>")
+  ~~~
+  Python parses stderr; if that fails, it falls back to the log.  
+  It also accepts the older wording `TOTAL counted:` if present.
 
-print(f"Arithmetic Intensity: {result.arithmetic_intensity:.6f} ops/byte")
-```
+---
 
-#### Parameter sweep:
-```bash
-python3 bench_runner.py test   # Quick test with PIN
-python3 bench_runner.py nopin  # Test without PIN
-```
+## Common flags
 
-#### Custom parameter sweep:
-```python
-import subprocess
-import re
+- `--ring-dim=N`
+- `--mult-depth=N`
+- `--scale-mod-size=N`
+- `--check-security` (boolean)
+- `--threads=N`
+- `--runs=N` (timing repetitions)
+- `--warmup=N` (warm-ups before timing)
+- `--sweep <name> v1 v2 ...`
+- `--thread-sweep n1 n2 ...`
+- `--json path.json`
+- `--no-build` (fail if exe is missing)
 
-# Run with different parameters
-for ring_dim in [4096, 8192, 16384, 32768]:
-    result = subprocess.run(
-        ["sudo", "/opt/intel/pin/pin", "-t", "/opt/profiling-tools/lib/pintool.so",
-         "--", "./build/addition", f"--ring-dim={ring_dim}"],
-        capture_output=True, text=True
-    )
-    
-    # Parse results
-    ops = re.search(r"TOTAL: (\d+)", result.stderr)
-    dram = re.search(r"DRAM_TOTAL_BYTES=(\d+)", result.stdout)
-    
-    if ops and dram:
-        ai = int(ops.group(1)) / int(dram.group(1))
-        print(f"Ring {ring_dim}: {ai:.6f} ops/byte")
-```
+---
 
-## Available Benchmarks
+## Output & logs
 
-- `addition.cpp` - Homomorphic addition of ciphertexts
-- `multiplication.cpp` - Homomorphic multiplication with relinearization
-- `rotation.cpp` - Ciphertext rotation operations
-- `simple-diagonal-method.cpp` - Basic matrix-vector multiplication
-- `bsgs-diagonal-method.cpp` - Baby-step giant-step optimization
-- `single-hoisted-diagonal-method.cpp` - Single hoisting optimization
-- `single-hoisted-bsgs-diagonal-method.cpp` - Combined optimizations
+- Python prints: runtime, DRAM, ops, arithmetic intensity (ops/byte), throughput, bandwidth.
+- Always-written logs (used as fallback parsers):
+  - `logs/dram_counts.out` → `DRAM_*` lines
+  - `logs/int_counts.out`  → `TOTAL: <u64>`
 
-Build any benchmark by specifying its source:
-```bash
-cmake -S . -B build -DBENCH_SOURCE=examples/multiplication.cpp
-cmake --build build
-```
-
-## Understanding the Output
-
-### Sample Output
-```
-=== Configuration ===
-Multiplicative depth: 19
-Scaling modulus size: 50
-Ring dimension: 8192
-Security check: DISABLED
-
-=== Addition Benchmark ===
-Input 1: (1, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, ... )
-Input 2: (2, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, ... )
-
-=== DRAM Traffic (Region) ===
-Read : 53.42 MiB
-Write: 38.03 MiB
-Total: 91.45 MiB
-
-[PIN] Final counts
-  ADD: 19230
-  SUB: 17274
-  MUL: 6
-  DIV: 9
-  TOTAL: 36519
-
-Arithmetic Intensity: 0.000382 ops/byte
-```
-
-### Metrics Explained
-
-- **Integer Operations**: Count of ADD, SUB, MUL, DIV instructions between PIN markers
-- **DRAM Traffic**: Total bytes read/written to main memory
-- **Arithmetic Intensity**: Ratio of operations to memory traffic (ops/byte)
-  - Higher values indicate better computational efficiency
-  - Typical FHE operations have very low AI (<1.0) due to large ciphertext sizes
-
-## Project Structure
-
-```
-openfhe-benchmarks/
-├── CMakeLists.txt              # Build configuration
-├── Makefile                    # Convenience targets
-├── examples/
-│   ├── utils.hpp              # Shared utilities, PIN markers, arg parsing
-│   ├── addition.cpp           # Addition benchmark
-│   ├── multiplication.cpp     # Multiplication benchmark
-│   └── ...                    # Other benchmarks
-├── build/                     # Build directory (generated)
-├── logs/                      # Profiling outputs (generated)
-│   ├── int_counts.out        # PIN operation counts
-│   └── dram_counts.out       # DRAM measurements
-├── bench_runner.py           # Python benchmark runner
-└── test_integration.py       # Integration tests
-```
-
-## System Components
-
-### Profiling Tools Location
-- `/opt/intel/pin/` - Intel PIN framework
-- `/opt/profiling-tools/lib/pintool.so` - Custom PIN instrumentation tool
-- `/opt/profiling-tools/include/dram_counter.hpp` - DRAM measurement header
-
-### How It Works
-
-1. **Compilation**: Benchmarks include PIN markers and DRAM counter
-2. **Execution**: PIN instruments the binary at runtime
-3. **Measurement**: 
-   - PIN counts integer operations between markers
-   - DRAM counter reads hardware performance counters
-4. **Output**: Results written to `logs/` and stdout
-5. **Analysis**: Python scripts parse and analyze results
+---
 
 ## Troubleshooting
 
-### PIN not counting operations
-```bash
-# Verify PIN tool is installed
-ls -la /opt/profiling-tools/lib/pintool.so
+- **Only runtime shown (DRAM/PIN say N/A):** passwordless sudo isn’t configured. Ensure `sudo -n true` succeeds for your user on this host.
+- **DRAM shows N/A:** enable perf & check IMC devices.
+  ~~~bash
+  sudo sh -c 'echo -1 > /proc/sys/kernel/perf_event_paranoid'
+  ls /sys/bus/event_source/devices/uncore_imc*
+  ~~~
+- **PIN not counting:** validate install & logs.
+  ~~~bash
+  ls -l /opt/profiling-tools/lib/pintool.so
+  sudo -n /opt/intel/pin/pin -t /opt/profiling-tools/lib/pintool.so -- /bin/true
+  cat logs/int_counts.out
+  ~~~
 
-# Test with simple validation
-sudo /opt/intel/pin/pin -t /opt/profiling-tools/lib/pintool.so -- \
-    /bin/echo "test"
+---
 
-# Check PIN output is being written
-cat logs/int_counts.out
-```
-
-### DRAM measurements show zero
-```bash
-# Enable performance counters
-sudo sh -c 'echo -1 > /proc/sys/kernel/perf_event_paranoid'
-
-# Verify uncore PMU support
-ls /sys/bus/event_source/devices/uncore_imc*
-```
-
-### Permission denied errors
-```bash
-# Most operations require sudo for hardware counter access
-sudo ./build/addition --ring-dim=8192
-```
-
-### Arithmetic intensity shows 0.000000
-The program reads log files after execution. PIN writes its output when the program ends, so you may need to run twice or parse PIN's stderr output directly (see Python examples).
-
-## Performance Considerations
-
-- **PIN overhead**: ~10-100x slowdown when instrumentation is active
-- **DRAM counter overhead**: Minimal (<1%)
-- **Temporary files**: Created in `/tmp/openfhe_bench_XXXXXX/` and auto-cleaned
-- **Log files**: Created in `./logs/` directory
-
-## Advanced Usage
-
-### Custom PIN Markers
-Add PIN markers around specific code regions:
-```cpp
-PIN_MARKER_START();
-// Code to profile
-auto result = cc->EvalMult(a, b);
-PIN_MARKER_END();
-```
-
-### Batch Processing
-```bash
-#!/bin/bash
-for dim in 4096 8192 16384 32768; do
-    echo "Testing ring dimension: $dim"
-    sudo /opt/intel/pin/pin -t /opt/profiling-tools/lib/pintool.so -- \
-        ./build/addition --ring-dim=$dim
-    
-    ops=$(grep -o '[0-9]*' logs/int_counts.out)
-    bytes=$(grep DRAM_TOTAL_BYTES logs/dram_counts.out | cut -d= -f2)
-    ai=$(echo "scale=6; $ops / $bytes" | bc)
-    echo "Ring $dim: AI = $ai ops/byte"
-done
-```
+## Project layout
+~~~text
+openfhe-benchmarks/
+├── benchmark.py                # Orchestrates build + 3-pass measurement
+├── examples/
+│   ├── utils.hpp               # Args, PIN markers, DRAM counter, helpers
+│   ├── addition.cpp            # Example benchmark
+│   └── ...
+├── src/
+│   ├── dram_counter.hpp        # DRAM PMU helper (installed system-wide)
+│   └── pintool.cpp             # Intel PIN tool (installed as pintool.so)
+├── build/                      # CMake build (generated)
+└── logs/
+    ├── dram_counts.out         # DRAM fallback
+    └── int_counts.out          # PIN fallback
+~~~
