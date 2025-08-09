@@ -3,6 +3,7 @@
 #include "utils.hpp"
 #include <iostream>
 #include <vector>
+#include <omp.h>  // Add OpenMP header
 
 // Headers needed for serialization
 #include <ciphertext-ser.h>
@@ -26,6 +27,26 @@ int main(int argc, char* argv[]) {
     MeasurementMode mode = parser.getMeasurementMode();
     bool quiet = parser.getBool("quiet", false);
     bool skipVerify = parser.getBool("skip-verify", false);
+    
+    // Set OpenMP threads if specified
+    uint32_t numThreads = parser.getUInt32("threads", 0);
+    if (numThreads > 0) {
+        omp_set_num_threads(numThreads);
+        if (!quiet) {
+            std::cout << "OpenMP threads set to: " << numThreads << std::endl;
+        }
+    }
+    
+    // Report actual thread count being used
+    if (!quiet) {
+        #pragma omp parallel
+        {
+            #pragma omp single
+            {
+                std::cout << "OpenMP using " << omp_get_num_threads() << " threads" << std::endl;
+            }
+        }
+    }
     
     MeasurementSystem measurement(mode, quiet);
     measurement.initialize();

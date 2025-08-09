@@ -9,6 +9,7 @@ import re
 import statistics
 import json
 import sys
+import os
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, asdict
@@ -145,31 +146,41 @@ class Benchmark:
         Run benchmark with specified parameters
         
         Args:
-            **params: Benchmark parameters (e.g., ring_dim=8192, mult_depth=10)
+            **params: Benchmark parameters (e.g., ring_dim=8192, threads=4)
         
         Returns:
             BenchmarkResult with all measurements
         """
+        # Extract thread count if specified
+        threads = params.pop('threads', None)
+        
         # Convert parameters to command-line arguments
         args = []
         for key, value in params.items():
             param_name = key.replace('_', '-')
             args.append(f"--{param_name}={value}")
         
-        result = BenchmarkResult(parameters=params)
+        # Add threads argument if specified
+        if threads:
+            args.append(f"--threads={threads}")
+        
+        result = BenchmarkResult(parameters={**params, 'threads': threads} if threads else params)
         
         # Measure performance
         print(f"\n🔬 Benchmarking {self.executable.name}")
-        if params:
-            print(f"   Parameters: {params}")
+        if params or threads:
+            display_params = {**params}
+            if threads:
+                display_params['threads'] = threads
+            print(f"   Parameters: {display_params}")
         
-        perf_data = self._measure_performance(args)
+        perf_data = self._measure_performance(args, threads)
         if perf_data:
             result.runtime_sec = perf_data['mean']
             result.runtime_stdev = perf_data['stdev']
         
         # Measure DRAM traffic
-        dram_data = self._measure_dram(args)
+        dram_data = self._measure_dram(args, threads)
         if dram_data:
             result.dram_read_bytes = dram_data.get('read')
             result.dram_write_bytes = dram_data.get('write')
@@ -177,7 +188,7 @@ class Benchmark:
         
         # Count operations (if PIN available)
         if self.pin_available:
-            ops_data = self._count_operations(args)
+            ops_data = self._count_operations(args, threads)
             if ops_data:
                 result.integer_ops = ops_data['total']
                 result.ops_breakdown = ops_data['breakdown']
@@ -187,17 +198,27 @@ class Benchmark:
         
         return result
     
-    def _measure_performance(self, args: List[str], runs: int = 3) -> Dict[str, float]:
+    def _prepare_env(self, threads: Optional[int]) -> Dict[str, str]:
+        """Prepare environment variables with thread control"""
+        env = os.environ.copy()
+        if threads:
+            env['OMP_NUM_THREADS'] = str(threads)
+        return env
+    
+    def _measure_performance(self, args: List[str], threads: Optional[int] = None, runs: int = 3) -> Dict[str, float]:
         """Measure runtime performance"""
-        print("  ⏱️  Measuring performance...", end=" ")
+        print(f"  ⏱️  Measuring performance...", end=" ")
+        if threads:
+            print(f"(threads={threads})", end=" ")
         
         times = []
         cmd = [str(self.executable)] + args + ["--measure=none", "--quiet=true", "--skip-verify=true"]
+        env = self._prepare_env(threads)
         
         for _ in range(runs):
             start = time.perf_counter()
             try:
-                subprocess.run(cmd, capture_output=True, check=True)
+                subprocess.run(cmd, capture_output=True, check=True, env=env)
                 times.append(time.perf_counter() - start)
             except subprocess.CalledProcessError:
                 return None
@@ -211,14 +232,15 @@ class Benchmark:
             return result
         return None
     
-    def _measure_dram(self, args: List[str]) -> Dict[str, int]:
+    def _measure_dram(self, args: List[str], threads: Optional[int] = None) -> Dict[str, int]:
         """Measure DRAM traffic using hardware counters"""
         print("  💾 Measuring memory traffic...", end=" ")
         
         cmd = ["sudo", str(self.executable)] + args + ["--measure=dram", "--quiet=true", "--skip-verify=true"]
+        env = self._prepare_env(threads)
         
         try:
-            result = subprocess.run(cmd, capture_output=True, check=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, check=True, text=True, env=env)
             
             dram_data = {}
             for line in result.stdout.split('\n'):
@@ -238,15 +260,16 @@ class Benchmark:
         print("N/A")
         return None
     
-    def _count_operations(self, args: List[str]) -> Dict[str, Any]:
+    def _count_operations(self, args: List[str], threads: Optional[int] = None) -> Dict[str, Any]:
         """Count operations using PIN instrumentation"""
         print("  🔢 Counting operations...", end=" ")
         
         cmd = ["sudo", self.pin_path, "-t", self.pintool_path, "--",
                str(self.executable)] + args + ["--measure=pin", "--quiet=true", "--skip-verify=true"]
+        env = self._prepare_env(threads)
         
         try:
-            result = subprocess.run(cmd, capture_output=True, check=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, check=True, text=True, env=env)
             
             ops_data = {'total': 0, 'breakdown': {}}
             
@@ -281,6 +304,32 @@ class Benchmark:
         print("N/A")
         return None
     
+    def thread_sweep(self, thread_counts: List[int], fixed_params: Dict[str, Any] = None) -> List[BenchmarkResult]:
+        """
+        Run benchmark across different thread counts
+        
+        Args:
+            thread_counts: List of thread counts to test
+            fixed_params: Other parameters to keep constant
+        
+        Returns:
+            List of BenchmarkResult objects
+        """
+        results = []
+        fixed_params = fixed_params or {}
+        
+        print(f"\n🧵 Thread scaling sweep")
+        print(f"   Thread counts: {thread_counts}")
+        if fixed_params:
+            print(f"   Fixed parameters: {fixed_params}")
+        
+        for threads in thread_counts:
+            params = {**fixed_params, 'threads': threads}
+            result = self.run(**params)
+            results.append(result)
+        
+        return results
+    
     def parameter_sweep(self, param_name: str, values: List[Any], 
                        fixed_params: Dict[str, Any] = None) -> List[BenchmarkResult]:
         """
@@ -311,22 +360,23 @@ class Benchmark:
     
     def compare_results(self, results: List[BenchmarkResult], param_name: str = None):
         """Print comparison table of multiple results"""
-        print("\n" + "="*80)
+        print("\n" + "="*100)
         print("COMPARISON TABLE")
-        print("="*80)
+        print("="*100)
         
         # Header
-        headers = ["Parameters", "Runtime (s)", "DRAM (MiB)", "Ops (M)", "AI (ops/B)", "Throughput"]
-        print(f"{'Parameters':<20} {'Runtime':<12} {'DRAM':<12} {'Ops':<12} {'AI':<12} {'Gops/s':<10}")
-        print("-"*80)
+        print(f"{'Parameters':<25} {'Runtime':<12} {'DRAM':<12} {'Ops':<12} {'AI':<12} {'Gops/s':<10} {'BW GB/s':<10}")
+        print("-"*100)
         
         # Rows
         for result in results:
             # Format parameters
             if param_name and result.parameters:
                 param_str = f"{param_name}={result.parameters.get(param_name, 'N/A')}"
+                if 'threads' in result.parameters:
+                    param_str += f", t={result.parameters['threads']}"
             else:
-                param_str = str(result.parameters)[:20]
+                param_str = str(result.parameters)[:25]
             
             # Format values
             runtime = f"{result.runtime_sec:.3f}" if result.runtime_sec else "N/A"
@@ -334,10 +384,11 @@ class Benchmark:
             ops = f"{result.integer_ops/1e6:.1f}" if result.integer_ops else "N/A"
             ai = f"{result.arithmetic_intensity:.4f}" if result.arithmetic_intensity else "N/A"
             throughput = f"{result.throughput_gops:.2f}" if result.throughput_gops else "N/A"
+            bandwidth = f"{result.bandwidth_gb_sec:.2f}" if result.bandwidth_gb_sec else "N/A"
             
-            print(f"{param_str:<20} {runtime:<12} {dram:<12} {ops:<12} {ai:<12} {throughput:<10}")
+            print(f"{param_str:<25} {runtime:<12} {dram:<12} {ops:<12} {ai:<12} {throughput:<10} {bandwidth:<10}")
         
-        print("="*80)
+        print("="*100)
 
 
 def main():
@@ -352,11 +403,14 @@ Examples:
   # Basic benchmark
   python3 benchmark.py ./build/addition --ring-dim=8192
   
-  # Multiple parameters
-  python3 benchmark.py ./build/addition --ring-dim=16384 --mult-depth=10
+  # With thread control
+  python3 benchmark.py ./build/addition --ring-dim=8192 --threads=4
+  
+  # Thread scaling sweep
+  python3 benchmark.py ./build/addition --thread-sweep 1 2 4 8 16 --ring-dim=8192
   
   # Parameter sweep
-  python3 benchmark.py ./build/addition --sweep ring-dim 4096 8192 16384
+  python3 benchmark.py ./build/addition --sweep ring-dim 4096 8192 16384 --threads=4
   
   # Save results
   python3 benchmark.py ./build/addition --ring-dim=8192 --json results.json
@@ -368,7 +422,9 @@ Examples:
     parser.add_argument("--mult-depth", type=int, help="Multiplicative depth")
     parser.add_argument("--scale-mod-size", type=int, help="Scaling modulus size")
     parser.add_argument("--check-security", type=bool, help="Enable security check")
+    parser.add_argument("--threads", type=int, help="Number of OpenMP threads")
     
+    parser.add_argument("--thread-sweep", nargs='+', type=int, help="Thread counts for scaling test")
     parser.add_argument("--sweep", nargs='+', help="Parameter sweep: name value1 value2 ...")
     parser.add_argument("--json", help="Save results to JSON file")
     
@@ -381,14 +437,30 @@ Examples:
         print(f"Error: {e}")
         sys.exit(1)
     
+    # Handle thread sweep
+    if args.thread_sweep:
+        fixed_params = {}
+        for param in ['ring_dim', 'mult_depth', 'scale_mod_size', 'check_security']:
+            value = getattr(args, param.replace('-', '_'))
+            if value is not None:
+                fixed_params[param] = value
+        
+        results = bench.thread_sweep(args.thread_sweep, fixed_params)
+        bench.compare_results(results, 'threads')
+        
+        if args.json:
+            with open(args.json, 'w') as f:
+                json.dump([asdict(r) for r in results], f, indent=2)
+            print(f"\n💾 Results saved to {args.json}")
+    
     # Handle parameter sweep
-    if args.sweep:
+    elif args.sweep:
         param_name = args.sweep[0]
         values = [int(v) if v.isdigit() else v for v in args.sweep[1:]]
         
         # Fixed parameters
         fixed_params = {}
-        for param in ['ring_dim', 'mult_depth', 'scale_mod_size', 'check_security']:
+        for param in ['ring_dim', 'mult_depth', 'scale_mod_size', 'check_security', 'threads']:
             value = getattr(args, param.replace('-', '_'))
             if value is not None and param.replace('_', '-') != param_name:
                 fixed_params[param] = value
@@ -404,7 +476,7 @@ Examples:
     # Single benchmark
     else:
         params = {}
-        for param in ['ring_dim', 'mult_depth', 'scale_mod_size', 'check_security']:
+        for param in ['ring_dim', 'mult_depth', 'scale_mod_size', 'check_security', 'threads']:
             value = getattr(args, param)
             if value is not None:
                 params[param] = value
