@@ -86,11 +86,30 @@ struct BenchmarkParams {
     }
 };
 
-// Thread setup
+// Thread setup with verification
 inline void setupThreads(const ArgParser& parser) {
-    uint32_t threads = parser.getUInt32("threads", 0);
-    if (threads > 0) {
-        omp_set_num_threads(threads);
+    uint32_t requested = parser.getUInt32("threads", 0);
+    bool quiet = parser.getBool("quiet", false);
+    MeasurementMode mode = parser.getMeasurementMode();
+    
+    if (requested > 0) {
+        omp_set_num_threads(requested);
+    }
+    
+    // Only report in latency mode (measure=none) to avoid repetition
+    if (!quiet && mode == MeasurementMode::NONE) {
+        #pragma omp parallel
+        {
+            #pragma omp single
+            {
+                uint32_t actual = omp_get_num_threads();
+                std::cout << "THREADS_ACTUAL=" << actual << std::endl;
+                if (requested > 0 && actual != requested) {
+                    std::cerr << "WARNING: Requested " << requested 
+                              << " threads but got " << actual << std::endl;
+                }
+            }
+        }
     }
 }
 

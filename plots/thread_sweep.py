@@ -1,14 +1,26 @@
+#!/usr/bin/env python3
 from benchmarker import Benchmarker
 
 b = Benchmarker()
 
-# Thread sweep
+# Thread sweep with all parameters explicit
 thread_counts = [1, 2, 4, 8, 16, 32]
 results = []
 
 for threads in thread_counts:
     print(f"Running with {threads} threads...")
-    result = b.run("addition", ring_dim=16384, num_digits=2, threads=threads)
+    result = b.run(
+        "multiplication", 
+        ring_dim=16384,
+        mult_depth=1,
+        num_digits=2,
+        threads=threads,
+        check_security=False,
+        timing_runs=3,
+        build=True,
+        quiet=True,
+        skip_verify=True
+    )
     
     latency = result['latency'][0] if result['latency'] else None
     results.append((threads, latency))
