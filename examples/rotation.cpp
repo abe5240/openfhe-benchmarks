@@ -1,9 +1,8 @@
 // examples/rotation.cpp - Minimal benchmark for homomorphic rotation
 #include <openfhe.h>
-#include <dram_counter.hpp>
+#include "utils.hpp"
 #include <iostream>
 #include <vector>
-#include <fstream>
 
 // Headers needed for serialization
 #include <ciphertext-ser.h>
@@ -13,65 +12,79 @@
 
 using namespace lbcrypto;
 
-// Global DRAM counter
-static DRAMCounter g_dram_counter;
-
-int main() {
-    // Initialize DRAM counter
-    if (!g_dram_counter.init()) {
-        std::cerr << "Warning: DRAM measurements disabled\n";
+int main(int argc, char* argv[]) {
+    // ============================================
+    // PARSE ARGUMENTS AND SETUP
+    // ============================================
+    
+    ArgParser parser;
+    parser.parse(argc, argv);
+    
+    if (parser.hasHelp()) {
+        parser.printUsage("rotation");
+        std::cout << "\nAdditional options:\n";
+        std::cout << "  --rotation-index=N    Rotation index (default: 1)\n";
+        return 0;
     }
-
+    
+    // Get common parameters
+    bool quiet = parser.getBool("quiet", false);
+    bool skipVerify = parser.getBool("skip-verify", false);
+    
+    // Get rotation-specific parameter
+    int32_t rotationIndex = static_cast<int32_t>(parser.getUInt32("rotation-index", 1));
+    
+    // Initialize thread management
+    ThreadManager threads(parser);
+    threads.initialize();
+    
+    // Setup measurement system
+    MeasurementMode mode = parser.getMeasurementMode();
+    MeasurementSystem measurement(mode, quiet);
+    measurement.initialize();
+    
+    // Get benchmark parameters
+    BenchmarkParams params = BenchmarkParams::fromArgs(parser);
+    
+    if (!quiet) {
+        params.print();
+        std::cout << "Rotation index: " << rotationIndex << std::endl;
+        std::cout << "Measurement mode: " << measurement.getModeString() << "\n\n";
+    }
+    
     // ============================================
-    // SETUP: Configure CKKS parameters
+    // SETUP CKKS CRYPTOCONTEXT
     // ============================================
     
-    uint32_t multDepth    = 19;
-    uint32_t numDigits    = 2;
-    uint32_t scaleModSize = 50;
-    uint32_t ringDim      = 65536;
+    CCParams<CryptoContextCKKSRNS> ccParams;
+    ccParams.SetMultiplicativeDepth(params.multDepth);
+    ccParams.SetScalingModSize(params.scaleModSize);
+    ccParams.SetRingDim(params.ringDim);
+    ccParams.SetSecurityLevel(params.checkSecurity ? HEStd_128_classic : HEStd_NotSet);
     
-    CCParams<CryptoContextCKKSRNS> params;
-    params.SetMultiplicativeDepth(multDepth);
-    params.SetScalingModSize(scaleModSize);
-    params.SetRingDim(ringDim);
-    params.SetScalingTechnique(FLEXIBLEAUTO);
-    params.SetKeySwitchTechnique(HYBRID);
-    params.SetNumLargeDigits(numDigits);
-    params.SetSecurityLevel(HEStd_128_classic);
+    // For rotation, we typically need these techniques
+    ccParams.SetScalingTechnique(FLEXIBLEAUTO);
+    ccParams.SetKeySwitchTechnique(HYBRID);
+    ccParams.SetNumLargeDigits(2);  // Good default for rotation
     
-    // Create cryptocontext
-    CryptoContext<DCRTPoly> cc = GenCryptoContext(params);
+    CryptoContext<DCRTPoly> cc = GenCryptoContext(ccParams);
     cc->Enable(PKE);
     cc->Enable(KEYSWITCH);
     cc->Enable(LEVELEDSHE);
 
-    std::cout << "=== Rotation Benchmark ===" << std::endl;
+    if (!quiet) {
+        std::cout << "=== Rotation Benchmark ===" << std::endl;
+    }
 
     // Generate key pair
     auto keyPair = cc->KeyGen();
     
-    // Generate rotation keys for specific indices
-    // Let's rotate by 1 position (you can change this)
-    int rotationIndex = 1;
+    // Generate rotation keys for the specified index
     std::vector<int32_t> rotationIndices = {rotationIndex};
     cc->EvalRotateKeyGen(keyPair.secretKey, rotationIndices);
 
     // ============================================
-    // SERIALIZE ROTATION KEY TO DISK
-    // ============================================
-    
-    std::cout << "Serializing rotation key for index " << rotationIndex << "..." << std::endl;
-    
-    std::ofstream rotKeyFile("data/rotationkey.bin", std::ios::binary);
-    if (!cc->SerializeEvalAutomorphismKey(rotKeyFile, SerType::BINARY)) {
-        std::cerr << "Failed to serialize rotation key" << std::endl;
-        return 1;
-    }
-    rotKeyFile.close();
-
-    // ============================================
-    // CREATE AND SERIALIZE INPUT CIPHERTEXT
+    // PREPARE TEST DATA
     // ============================================
     
     std::vector<double> vec = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
@@ -79,36 +92,64 @@ int main() {
     // Encode as plaintext
     Plaintext ptxt = cc->MakeCKKSPackedPlaintext(vec);
     
-    std::cout << "Input: " << ptxt << std::endl;
+    if (!quiet) {
+        std::cout << "Input: " << ptxt << std::endl;
+        std::cout << "Rotating by: " << rotationIndex << " positions" << std::endl;
+    }
 
     // Encrypt
     auto cipher = cc->Encrypt(keyPair.publicKey, ptxt);
 
-    // Serialize input ciphertext
-    std::cout << "Serializing input ciphertext..." << std::endl;
+    // ============================================
+    // SERIALIZE TO TEMPORARY FILES
+    // ============================================
     
-    if (!Serial::SerializeToFile("data/cipher.bin", cipher, SerType::BINARY)) {
+    TempDirectory tempDir;
+    if (!tempDir.isValid()) {
+        std::cerr << "Failed to create temporary directory" << std::endl;
+        return 1;
+    }
+
+    if (!quiet) {
+        std::cout << "Serializing input ciphertext and rotation key..." << std::endl;
+    }
+    
+    std::string cipherPath = tempDir.getFilePath("cipher.bin");
+    std::string rotKeyPath = tempDir.getFilePath("rotationkey.bin");
+    std::string resultPath = tempDir.getFilePath("result.bin");
+    
+    // Serialize input ciphertext
+    if (!Serial::SerializeToFile(cipherPath, cipher, SerType::BINARY)) {
         std::cerr << "Failed to serialize ciphertext" << std::endl;
         return 1;
     }
     
-    std::cout << "Serialization complete\n" << std::endl;
+    // Serialize rotation key
+    std::ofstream rotKeyFile(rotKeyPath, std::ios::binary);
+    if (!cc->SerializeEvalAutomorphismKey(rotKeyFile, SerType::BINARY)) {
+        std::cerr << "Failed to serialize rotation key" << std::endl;
+        return 1;
+    }
+    rotKeyFile.close();
+    
+    if (!quiet) {
+        std::cout << "Serialization complete\n" << std::endl;
+        std::cout << "Starting profiled rotation...\n" << std::endl;
+    }
 
     // Clear everything from memory to ensure we're loading from disk
     cc->ClearEvalAutomorphismKeys();
     cipher.reset();
 
     // ============================================
-    // PROFILED COMPUTATION
+    // PROFILED FHE COMPUTATION
     // ============================================
     
-    std::cout << "Starting profiled rotation by " << rotationIndex << "...\n" << std::endl;
-    
-    // Start DRAM traffic measurement (includes all I/O and computation)
-    g_dram_counter.start();
-    
+    // Start DRAM measurement (includes all I/O and computation)
+    measurement.startDRAM();
+
     // Load rotation key from disk
-    std::ifstream rotKeyIn("data/rotationkey.bin", std::ios::binary);
+    std::ifstream rotKeyIn(rotKeyPath, std::ios::binary);
     if (!cc->DeserializeEvalAutomorphismKey(rotKeyIn, SerType::BINARY)) {
         std::cerr << "Failed to load rotation key" << std::endl;
         return 1;
@@ -117,52 +158,65 @@ int main() {
     
     // Load input ciphertext from disk
     Ciphertext<DCRTPoly> cipherLoaded;
-    if (!Serial::DeserializeFromFile("data/cipher.bin", cipherLoaded, SerType::BINARY)) {
+    
+    if (!Serial::DeserializeFromFile(cipherPath, cipherLoaded, SerType::BINARY)) {
         std::cerr << "Failed to load ciphertext" << std::endl;
         return 1;
     }
     
-    // Start integer operation counting
-    PIN_MARKER_START();
+    // PIN markers around ONLY the FHE operation
+    measurement.startPIN();
     
-    // Perform rotation (includes key switching)
+    // Perform homomorphic rotation (includes key switching)
     auto cipherResult = cc->EvalRotate(cipherLoaded, rotationIndex);
     
-    // Stop integer operation counting
-    PIN_MARKER_END();
-    
-    // Serialize and save output ciphertext
-    if (!Serial::SerializeToFile("data/result.bin", cipherResult, SerType::BINARY)) {
+    measurement.endPIN();
+        
+    // Serialize result
+    if (!Serial::SerializeToFile(resultPath, cipherResult, SerType::BINARY)) {
         std::cerr << "Failed to save result ciphertext" << std::endl;
         return 1;
     }
     
-    // Stop DRAM traffic measurement
-    g_dram_counter.stop();
+    // Stop DRAM measurement
+    measurement.stopDRAM();
     
-    // Print DRAM results
-    g_dram_counter.print_results(true);
+    // Print measurement results
+    measurement.printResults();
     
     // ============================================
-    // VERIFICATION: Decrypt and check result
+    // VERIFICATION (OPTIONAL)
     // ============================================
     
-    std::cout << "\nDecrypting result..." << std::endl;
-    
-    Plaintext result;
-    cc->Decrypt(keyPair.secretKey, cipherResult, &result);
-    result->SetLength(vec.size());
-    
-    std::cout.precision(8);
-    std::cout << "Result: " << result << std::endl;
-    
-    // Show expected values (rotation by 1 shifts everything left)
-    std::cout << "Expected: (";
-    for (size_t i = 0; i < vec.size(); i++) {
-        std::cout << vec[(i + rotationIndex) % vec.size()];
-        if (i < vec.size() - 1) std::cout << ", ";
+    if (!quiet && !skipVerify) {
+        std::cout << "\nDecrypting result..." << std::endl;
+        
+        Plaintext result;
+        cc->Decrypt(keyPair.secretKey, cipherResult, &result);
+        result->SetLength(vec.size());
+        
+        // Get actual result vector
+        auto resultVec = result->GetRealPackedValue();
+        
+        // Compute expected values (rotation shifts elements left)
+        std::vector<double> expected;
+        for (size_t i = 0; i < vec.size(); i++) {
+            // Positive rotation index rotates left (cyclically)
+            size_t srcIndex = (i + rotationIndex) % vec.size();
+            // Handle negative rotation indices correctly
+            if (rotationIndex < 0) {
+                int adjustedIndex = static_cast<int>(i) + rotationIndex;
+                while (adjustedIndex < 0) {
+                    adjustedIndex += vec.size();
+                }
+                srcIndex = adjustedIndex;
+            }
+            expected.push_back(vec[srcIndex]);
+        }
+        
+        // Use the simple verification function from utils.hpp
+        verifyResult(resultVec, expected);
     }
-    std::cout << ")" << std::endl;
     
     return 0;
 }

@@ -2,6 +2,7 @@
 """
 benchmark.py - OpenFHE Benchmark Runner with Arithmetic Intensity Measurement
 Enhanced with automatic building, warm-up runs, and smart rebuilds.
+Fixed to handle custom parameters correctly in comparison tables.
 
 Usage Examples:
     # Command line
@@ -91,7 +92,9 @@ class BenchmarkResult:
         if self.parameters:
             print("\nParameters:")
             for key, value in self.parameters.items():
-                print(f"  {key}: {value}")
+                # Display with hyphens for consistency
+                display_key = key.replace('_', '-')
+                print(f"  {display_key}: {value}")
 
         print(f"\nPerformance:")
         print(
@@ -137,7 +140,7 @@ class BenchmarkResult:
                 )
 
         if self.throughput_gops:
-            print(f"  Throughput: {self._format_throughput(self.throughput_gops)}")  # noqa: E501
+            print(f"  Throughput: {self._format_throughput(self.throughput_gops)}")
 
         if self.bandwidth_gb_sec:
             print(
@@ -353,16 +356,18 @@ class Benchmark:
         if threads:
             args.append(f"--threads={threads}")
 
-        result = BenchmarkResult(
-            parameters={**params, 'threads': threads} if threads else params
-        )
+        # Store all parameters (including custom ones) for result
+        all_params = {**params}
+        if threads:
+            all_params['threads'] = threads
+            
+        result = BenchmarkResult(parameters=all_params)
 
         # Measure performance
         print(f"\n🔬 Benchmarking {self.benchmark_name}")
-        if params or threads:
-            display_params = {**params}
-            if threads:
-                display_params['threads'] = threads
+        if all_params:
+            # Display parameters with hyphens for consistency
+            display_params = {k.replace('_', '-'): v for k, v in all_params.items()}
             print(f"   Parameters: {display_params}")
 
         perf_data = self._measure_performance(args, threads, runs)
@@ -377,7 +382,7 @@ class Benchmark:
             result.dram_write_bytes = dram_data.get('write')
             result.dram_total_bytes = dram_data.get('total')
 
-        # Count operations (if PIN available), else print reason (item 5)
+        # Count operations (if PIN available)
         if self.pin_available and self._check_sudo():
             ops_data = self._count_operations(args, threads)
             if ops_data:
@@ -464,8 +469,6 @@ class Benchmark:
             return out
         return None
 
-    # ---------- Fallback parsers (item 3) ----------
-
     def _fallback_parse_dram_log(self) -> Optional[Dict[str, int]]:
         """Read logs/dram_counts.out and parse DRAM_* lines."""
         path = self.project_root / "logs" / "dram_counts.out"
@@ -504,7 +507,7 @@ class Benchmark:
         try:
             with path.open("r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
-            # Accept both historical and current wording (item 4)
+            # Accept both historical and current wording
             m = re.search(r'\bTOTAL(?: counted)?:\s*(\d+)', text)
             if m:
                 out['total'] = int(m.group(1))
@@ -513,8 +516,6 @@ class Benchmark:
         except Exception:
             return None
         return None
-
-    # ---------- DRAM measurement ----------
 
     def _measure_dram(
         self, args: List[str], threads: Optional[int] = None
@@ -558,7 +559,6 @@ class Benchmark:
                 dram_data = data
 
         except subprocess.CalledProcessError as e:
-            # Try fallback even if the process errored
             dram_data = self._fallback_parse_dram_log()
             if not dram_data:
                 print("failed")
@@ -566,14 +566,12 @@ class Benchmark:
                     print(f"  Error: {e.stderr[:200]}")
                 return None
         except subprocess.TimeoutExpired:
-            # Try fallback on timeout too
             dram_data = self._fallback_parse_dram_log()
             if not dram_data:
                 print("timeout")
                 return None
 
         if not dram_data:
-            # Fallback to log file (item 3)
             dram_data = self._fallback_parse_dram_log()
 
         if dram_data and dram_data.get('total'):
@@ -582,8 +580,6 @@ class Benchmark:
 
         print("N/A (parse failed)")
         return None
-
-    # ---------- PIN op counting ----------
 
     def _count_operations(
         self, args: List[str], threads: Optional[int] = None
@@ -607,7 +603,6 @@ class Benchmark:
 
             stderr_text = result.stderr
 
-            # Accept both "TOTAL:" and "TOTAL counted:" (item 4)
             total_match = re.search(
                 r'\bTOTAL(?: counted)?:\s*(\d+)', stderr_text
             )
@@ -620,7 +615,6 @@ class Benchmark:
                     ops_data['breakdown'][op] = int(m.group(1))
 
         except subprocess.CalledProcessError as e:
-            # Fallback to the log file (item 3)
             fb = self._fallback_parse_pin_log()
             if fb and fb.get('total', 0) > 0:
                 print(f"{fb['total']:,} ops (from log)")
@@ -638,7 +632,6 @@ class Benchmark:
             return None
 
         if ops_data['total'] <= 0:
-            # Fallback if parsing stderr yielded nothing
             fb = self._fallback_parse_pin_log()
             if fb and fb.get('total', 0) > 0:
                 print(f"{fb['total']:,} ops (from log)")
@@ -648,8 +641,6 @@ class Benchmark:
 
         print(f"{ops_data['total']:,} ops")
         return ops_data
-
-    # ---------- Sweeps and comparison ----------
 
     def thread_sweep(
         self, thread_counts: List[int], runs: int = 3,
@@ -663,7 +654,8 @@ class Benchmark:
         print(f"   Thread counts: {thread_counts}")
         print(f"   Runs per test: {runs}")
         if fixed_params:
-            print(f"   Fixed parameters: {fixed_params}")
+            display_params = {k.replace('_', '-'): v for k, v in fixed_params.items()}
+            print(f"   Fixed parameters: {display_params}")
 
         for threads in thread_counts:
             params = {**fixed_params, 'threads': threads}
@@ -680,11 +672,15 @@ class Benchmark:
         results = []
         fixed_params = fixed_params or {}
 
-        print(f"\n📊 Parameter sweep: {param_name}")
+        # Display with hyphens for consistency
+        display_name = param_name.replace('_', '-')
+        
+        print(f"\n📊 Parameter sweep: {display_name}")
         print(f"   Values: {values}")
         print(f"   Runs per test: {runs}")
         if fixed_params:
-            print(f"   Fixed: {fixed_params}")
+            display_params = {k.replace('_', '-'): v for k, v in fixed_params.items()}
+            print(f"   Fixed: {display_params}")
 
         for value in values:
             params = {**fixed_params, param_name: value}
@@ -705,12 +701,35 @@ class Benchmark:
 
         for result in results:
             if param_name and result.parameters:
-                pval = result.parameters.get(param_name, 'N/A')
-                param_str = f"{param_name}={pval}"
+                # Try both underscore and hyphen versions
+                pval = result.parameters.get(param_name)
+                if pval is None:
+                    # Try with underscores converted
+                    alt_name = param_name.replace('-', '_')
+                    pval = result.parameters.get(alt_name)
+                if pval is None:
+                    # Try with hyphens converted
+                    alt_name = param_name.replace('_', '-')
+                    pval = result.parameters.get(alt_name)
+                if pval is None:
+                    pval = 'N/A'
+                    
+                # Display with hyphens for consistency
+                display_name = param_name.replace('_', '-')
+                param_str = f"{display_name}={pval}"
+                
                 if 'threads' in result.parameters:
                     param_str += f", t={result.parameters['threads']}"
             else:
-                param_str = str(result.parameters)[:30]
+                # Format all parameters for display
+                if result.parameters:
+                    param_items = []
+                    for k, v in result.parameters.items():
+                        display_key = k.replace('_', '-')
+                        param_items.append(f"{display_key}={v}")
+                    param_str = ", ".join(param_items)[:40]
+                else:
+                    param_str = "N/A"
 
             runtime = (
                 f"{result.runtime_sec:.3f}" if result.runtime_sec else "N/A"
@@ -825,24 +844,33 @@ def main():
         epilog="""
 Examples:
   # Basic benchmark (auto-builds if needed)
-  python3 benchmark.py addition --ring-dim=8192
+  python3 benchmark.py addition --ring-dim=8192 --num-limbs=20
+
+  # With 128-bit security enabled
+  python3 benchmark.py addition --ring-dim=8192 --check-security
 
   # Run with more repetitions for better statistics
   python3 benchmark.py addition --ring-dim=8192 --runs=10
 
-  # Thread scaling sweep with 5 runs each
-  python3 benchmark.py multiplication --thread-sweep 1 2 4 8 \
+  # Thread scaling sweep
+  python3 benchmark.py multiplication --thread-sweep 1 2 4 8 \\
       --ring-dim=8192 --runs=5
 
-  # Parameter sweep with custom runs
-  python3 benchmark.py rotation --sweep ring-dim 4096 8192 16384 \
-      --threads=4 --runs=7
+  # Parameter sweep on ring dimension
+  python3 benchmark.py rotation --sweep ring-dim 4096 8192 16384 \\
+      --threads=4 --runs=3
 
-  # Quick single run for testing
-  python3 benchmark.py addition --ring-dim=8192 --runs=1
+  # Matrix dimension sweep for diagonal method
+  python3 benchmark.py simple-diagonal-method --sweep matrix-dim 8 16 32 \\
+      --ring-dim=256 --runs=3
 
-  # Use pre-built executable
-  python3 benchmark.py --exe ./build/addition --ring-dim=8192
+  # Number of limbs sweep (mult_depth = limbs - 1)
+  python3 benchmark.py addition --sweep num-limbs 10 15 20 25 \\
+      --ring-dim=8192 --runs=3
+
+  # Number of digits sweep
+  python3 benchmark.py multiplication --sweep num-digits 1 2 3 4 \\
+      --ring-dim=8192 --check-security --runs=3
 
   # Save results to JSON
   python3 benchmark.py addition --ring-dim=8192 --json results.json
@@ -858,17 +886,16 @@ Examples:
         help="Path to pre-built executable (alternative to benchmark name)"
     )
 
-    # Benchmark parameters
+    # Core benchmark parameters
     parser.add_argument("--ring-dim", type=int, help="Ring dimension")
-    parser.add_argument("--mult-depth", type=int, help="Multiplicative depth")
-    parser.add_argument("--scale-mod-size", type=int,
-                        help="Scaling modulus size")
-    parser.add_argument(
-        "--check-security", action='store_true',
-        help="Enable security check"
-    )
-    parser.add_argument("--threads", type=int,
-                        help="Number of OpenMP threads")
+    parser.add_argument("--num-limbs", type=int, help="Number of limbs (mult_depth = limbs - 1)")
+    parser.add_argument("--num-digits", type=int, help="Number of large digits (default: 2)")
+    parser.add_argument("--check-security", action='store_true', 
+                        help="Enable 128-bit classic security (default: disabled)")
+    parser.add_argument("--threads", type=int, help="Number of OpenMP threads")
+    
+    # Benchmark-specific parameters
+    parser.add_argument("--matrix-dim", type=int, help="Matrix dimension (diagonal methods only)")
 
     # Performance measurement
     parser.add_argument(
@@ -910,11 +937,19 @@ Examples:
     else:
         parser.error("Must specify either benchmark name or --exe path")
 
+    # Collect all possible parameters
+    all_param_names = [
+        'ring_dim', 'num_limbs', 'num_digits', 'check_security', 'threads',
+        'matrix_dim'
+    ]
+
     # Thread sweep
     if args.thread_sweep:
         fixed_params = {}
-        for param in ['ring_dim', 'mult_depth', 'scale_mod_size']:
-            value = getattr(args, param.replace('-', '_'))
+        for param in all_param_names:
+            if param == 'threads':
+                continue  # Don't include threads in fixed params
+            value = getattr(args, param)
             if value is not None:
                 fixed_params[param] = value
 
@@ -942,19 +977,22 @@ Examples:
                 values.append(v)
 
         fixed_params = {}
-        for param in ['ring_dim', 'mult_depth', 'scale_mod_size', 'threads']:
-            value = getattr(args, param.replace('-', '_'))
-            if value is not None and param.replace('_', '-') != param_name:
+        for param in all_param_names:
+            value = getattr(args, param.replace('_', '-').replace('-', '_'))
+            if value is not None and param.replace('_', '-') != param_name and param != param_name:
                 fixed_params[param] = value
 
         if args.check_security:
             fixed_params['check_security'] = True
 
+        # Convert param name to underscore version for internal use
+        param_name_internal = param_name.replace('-', '_')
+        
         results = bench.parameter_sweep(
-            param_name.replace('-', '_'), values, runs=args.runs,
+            param_name_internal, values, runs=args.runs,
             fixed_params=fixed_params
         )
-        bench.compare_results(results, param_name)
+        bench.compare_results(results, param_name_internal)
 
         if args.json:
             with open(args.json, 'w') as f:
@@ -964,8 +1002,8 @@ Examples:
     # Single benchmark
     else:
         params = {}
-        for param in ['ring_dim', 'mult_depth', 'scale_mod_size', 'threads']:
-            value = getattr(args, param.replace('-', '_'))
+        for param in all_param_names:
+            value = getattr(args, param)
             if value is not None:
                 params[param] = value
 

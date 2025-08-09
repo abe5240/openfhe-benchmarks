@@ -52,9 +52,13 @@ int main(int argc, char* argv[]) {
     
     CCParams<CryptoContextCKKSRNS> ccParams;
     ccParams.SetMultiplicativeDepth(params.multDepth);
-    ccParams.SetScalingModSize(params.scaleModSize);
+    ccParams.SetScalingModSize(50);  
     ccParams.SetRingDim(params.ringDim);
     ccParams.SetSecurityLevel(params.checkSecurity ? HEStd_128_classic : HEStd_NotSet);
+    
+    ccParams.SetScalingTechnique(FLEXIBLEAUTO);
+    ccParams.SetKeySwitchTechnique(HYBRID);
+    ccParams.SetNumLargeDigits(params.numDigits);
     
     CryptoContext<DCRTPoly> cc = GenCryptoContext(ccParams);
     cc->Enable(PKE);

@@ -117,9 +117,9 @@ public:
         std::cout << "Usage: " << programName << " [options]\n\n";
         std::cout << "Options:\n";
         std::cout << "  --ring-dim=N          Ring dimension (default: 65536)\n";
-        std::cout << "  --mult-depth=N        Multiplicative depth (default: 19)\n";
-        std::cout << "  --scale-mod-size=N    Scaling modulus size (default: 50)\n";
-        std::cout << "  --check-security=BOOL Enable security check (default: false)\n";
+        std::cout << "  --num-limbs=N         Number of limbs (default: 20, gives depth 19)\n";
+        std::cout << "  --num-digits=N        Number of large digits (default: 2)\n";
+        std::cout << "  --check-security      Enable 128-bit classic security (default: disabled)\n";
         std::cout << "  --threads=N           Number of OpenMP threads (default: system)\n";
         std::cout << "  --measure=MODE        Measurement mode: none|dram|pin|all (default: dram)\n";
         std::cout << "  --quiet=BOOL          Suppress output (default: false)\n";
@@ -135,24 +135,30 @@ public:
 struct BenchmarkParams {
     uint32_t ringDim;
     uint32_t multDepth;
-    uint32_t scaleModSize;
+    uint32_t numLimbs;  // Store original limbs value for display
+    uint32_t numDigits;
     bool checkSecurity;
     
     static BenchmarkParams fromArgs(const ArgParser& parser) {
+        // Get num-limbs from user (what they specify)
+        uint32_t limbs = parser.getUInt32("num-limbs", 20);  // Default 20 limbs = 19 depth
+        
         return {
             .ringDim = parser.getUInt32("ring-dim", 65536),
-            .multDepth = parser.getUInt32("mult-depth", 19),
-            .scaleModSize = parser.getUInt32("scale-mod-size", 50),
+            .multDepth = limbs - 1,  // Convert limbs to depth for OpenFHE
+            .numLimbs = limbs,
+            .numDigits = parser.getUInt32("num-digits", 2),
             .checkSecurity = parser.getBool("check-security", false)
         };
     }
     
     void print() const {
         std::cout << "\n=== Configuration ===" << std::endl;
-        std::cout << "Multiplicative depth: " << multDepth << std::endl;
-        std::cout << "Scaling modulus size: " << scaleModSize << std::endl;
         std::cout << "Ring dimension: " << ringDim << std::endl;
-        std::cout << "Security check: " << (checkSecurity ? "ENABLED" : "DISABLED") << std::endl;
+        std::cout << "Number of limbs: " << numLimbs << std::endl;
+        std::cout << "Multiplicative depth: " << multDepth << " (limbs - 1)" << std::endl;
+        std::cout << "Number of digits: " << numDigits << std::endl;
+        std::cout << "Security check: " << (checkSecurity ? "128-bit classic" : "NotSet") << std::endl;
     }
 };
 

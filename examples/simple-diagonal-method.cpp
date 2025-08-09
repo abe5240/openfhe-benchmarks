@@ -1,6 +1,5 @@
 // examples/simple-diagonal-method.cpp - Diagonal method for matrix-vector multiplication
 #include <openfhe.h>
-#include <dram_counter.hpp>
 #include "utils.hpp"
 #include <iostream>
 #include <iomanip>
@@ -16,53 +15,91 @@
 #include <key/key-ser.h>
 #include <scheme/ckksrns/ckksrns-ser.h>
 
-
 using namespace lbcrypto;
 
-// Global DRAM counter
-static DRAMCounter g_dram_counter;
-
-int main() {
-    // Initialize DRAM counter
-    if (!g_dram_counter.init()) {
-        std::cerr << "Warning: DRAM measurements disabled\n";
-    }
-
+int main(int argc, char* argv[]) {
     // ============================================
-    // SETUP: Configure CKKS parameters
+    // PARSE ARGUMENTS AND SETUP
     // ============================================
     
-    uint32_t numLimbs     = 4;
-    uint32_t numDigits    = 1;
-    uint32_t scaleModSize = 50;
-    uint32_t ringDim      = 128; 
-    std::size_t matrixDim = 16;  // Actual matrix dimension
-
-    CCParams<CryptoContextCKKSRNS> params;
-    params.SetMultiplicativeDepth(numLimbs - 1);
-    params.SetScalingModSize(scaleModSize);
-    params.SetRingDim(ringDim);
-    params.SetScalingTechnique(FLEXIBLEAUTO);
-    params.SetKeySwitchTechnique(HYBRID);
-    params.SetNumLargeDigits(numDigits);
-    params.SetSecurityLevel(HEStd_NotSet);
-
-    // Create cryptocontext
-    CryptoContext<DCRTPoly> cc = GenCryptoContext(params);
+    ArgParser parser;
+    parser.parse(argc, argv);
+    
+    if (parser.hasHelp()) {
+        parser.printUsage("simple-diagonal-method");
+        std::cout << "\nAdditional options:\n";
+        std::cout << "  --matrix-dim=N        Matrix dimension (default: 16)\n";
+        std::cout << "  --num-limbs=N         Number of limbs for depth (default: 4)\n";
+        std::cout << "  --num-digits=N        Number of large digits (default: 1)\n";
+        return 0;
+    }
+    
+    // Get common parameters
+    bool quiet = parser.getBool("quiet", false);
+    bool skipVerify = parser.getBool("skip-verify", false);
+    
+    // Get method-specific parameters
+    std::size_t matrixDim = static_cast<std::size_t>(parser.getUInt32("matrix-dim", 16));
+    uint32_t numLimbs = parser.getUInt32("num-limbs", 4);
+    uint32_t numDigits = parser.getUInt32("num-digits", 1);
+    
+    // Initialize thread management
+    ThreadManager threads(parser);
+    threads.initialize();
+    
+    // Setup measurement system
+    MeasurementMode mode = parser.getMeasurementMode();
+    MeasurementSystem measurement(mode, quiet);
+    measurement.initialize();
+    
+    // Get benchmark parameters (override some defaults for this method)
+    BenchmarkParams params = BenchmarkParams::fromArgs(parser);
+    
+    // Override ring dimension if not specified - use smaller default for simple diagonal
+    if (parser.getString("ring-dim").empty()) {
+        params.ringDim = 128;  // Default for simple diagonal method
+    }
+    
+    // Override mult depth based on numLimbs
+    params.multDepth = numLimbs - 1;
+    
+    if (!quiet) {
+        params.print();
+        std::cout << "Matrix dimension: " << matrixDim << "×" << matrixDim << std::endl;
+        std::cout << "Number of limbs: " << numLimbs << std::endl;
+        std::cout << "Number of digits: " << numDigits << std::endl;
+        std::cout << "Measurement mode: " << measurement.getModeString() << "\n\n";
+    }
+    
+    // ============================================
+    // SETUP CKKS CRYPTOCONTEXT
+    // ============================================
+    
+    CCParams<CryptoContextCKKSRNS> ccParams;
+    ccParams.SetMultiplicativeDepth(params.multDepth);
+    ccParams.SetScalingModSize(params.scaleModSize);
+    ccParams.SetRingDim(params.ringDim);
+    ccParams.SetScalingTechnique(FLEXIBLEAUTO);
+    ccParams.SetKeySwitchTechnique(HYBRID);
+    ccParams.SetNumLargeDigits(numDigits);
+    ccParams.SetSecurityLevel(params.checkSecurity ? HEStd_128_classic : HEStd_NotSet);
+    
+    CryptoContext<DCRTPoly> cc = GenCryptoContext(ccParams);
     cc->Enable(PKE);
     cc->Enable(KEYSWITCH);
     cc->Enable(LEVELEDSHE);
 
     uint32_t numSlots = cc->GetEncodingParams()->GetBatchSize();
     if (matrixDim > numSlots) {
-        std::cerr << "Error: matrixDim must be <= numSlots\n";
+        std::cerr << "Error: matrixDim (" << matrixDim << ") must be <= numSlots (" << numSlots << ")\n";
         return 1;
     }
     
-    std::cout << "=== Diagonal Method for Matrix-Vector Multiplication ===\n";
-    std::cout << "Actual matrix dimension: " << matrixDim << "×" << matrixDim << "\n";
-    std::cout << "Number of slots: " << numSlots << "\n";
-    std::cout << "Ring dimension: " << ringDim << "\n\n";
+    if (!quiet) {
+        std::cout << "=== Diagonal Method for Matrix-Vector Multiplication ===" << std::endl;
+        std::cout << "Actual matrix dimension: " << matrixDim << "×" << matrixDim << std::endl;
+        std::cout << "Number of slots: " << numSlots << std::endl;
+    }
 
     // Generate key pair
     auto keyPair = cc->KeyGen();
@@ -71,20 +108,35 @@ int main() {
     // CREATE MATRIX AND VECTOR
     // ============================================
     
-    // Create embedded random matrix
+    // Create embedded random matrix and input vector
     auto M = make_embedded_random_matrix(matrixDim, numSlots);
     auto inputVec = make_random_input_vector(matrixDim, numSlots);
-    print_matrix(M, matrixDim);
+    
+    if (!quiet) {
+        print_matrix(M, matrixDim);
+    }
 
     // ============================================
     // EXTRACT AND ENCODE ALL NON-EMPTY DIAGONALS
     // ============================================
     
-    std::cout << "Extracting diagonals...\n";
+    if (!quiet) {
+        std::cout << "Extracting diagonals..." << std::endl;
+    }
     
-    // Extract all non-empty diagonals using the simplified approach
+    // Extract all non-empty diagonals
     auto diagonals = extract_generalized_diagonals(M, matrixDim);
-    std::cout << "Found " << diagonals.size() << " non-empty diagonals\n";
+    
+    if (!quiet) {
+        std::cout << "Found " << diagonals.size() << " non-empty diagonals" << std::endl;
+    }
+    
+    // Create temporary directory for files
+    TempDirectory tempDir;
+    if (!tempDir.isValid()) {
+        std::cerr << "Failed to create temporary directory" << std::endl;
+        return 1;
+    }
     
     // Generate and serialize rotation keys individually
     // k=0 doesn't need rotation, so we skip it
@@ -96,20 +148,23 @@ int main() {
         }
     }
     
-    std::cout << "Generating and saving " << rotationIndices.size() << " rotation keys individually...\n";
+    if (!quiet) {
+        std::cout << "Generating and saving " << rotationIndices.size() << " rotation keys..." << std::endl;
+    }
     
     // Generate and save each rotation key separately
     for (int32_t k : rotationIndices) {
         // Generate key for this specific rotation
         cc->EvalRotateKeyGen(keyPair.secretKey, {k});
         
-        // Save with descriptive filename: rotation-key-k{value}.bin
+        // Save with descriptive filename
         std::stringstream filename;
-        filename << "data/rotation-key-k" << k << ".bin";
+        filename << "rotation-key-k" << k << ".bin";
+        std::string keyPath = tempDir.getDataPath(filename.str());
         
-        std::ofstream keyFile(filename.str(), std::ios::binary);
+        std::ofstream keyFile(keyPath, std::ios::binary);
         if (!cc->SerializeEvalAutomorphismKey(keyFile, SerType::BINARY)) {
-            std::cerr << "Failed to serialize rotation key for k=" << k << "\n";
+            std::cerr << "Failed to serialize rotation key for k=" << k << std::endl;
             return 1;
         }
         keyFile.close();
@@ -117,8 +172,6 @@ int main() {
         // Clear the key from memory immediately after saving
         cc->ClearEvalAutomorphismKeys();
     }
-    
-    std::cout << "Saved " << rotationIndices.size() << " rotation key files\n";
     
     // Encode diagonals as plaintexts
     std::map<int, Plaintext> diagonalPlaintexts;
@@ -136,32 +189,38 @@ int main() {
     // SERIALIZE INPUT
     // ============================================
     
-    std::cout << "Serializing input...\n";
+    if (!quiet) {
+        std::cout << "Serializing input..." << std::endl;
+    }
     
-    if (!Serial::SerializeToFile("data/input.bin", inputCipher, SerType::BINARY)) {
-        std::cerr << "Failed to serialize input\n";
+    std::string inputPath = tempDir.getDataPath("input.bin");
+    if (!Serial::SerializeToFile(inputPath, inputCipher, SerType::BINARY)) {
+        std::cerr << "Failed to serialize input" << std::endl;
         return 1;
     }
     
     inputCipher.reset();
 
+    if (!quiet) {
+        std::cout << "Starting profiled computation...\n" << std::endl;
+    }
+
     // ============================================
     // PROFILED DIAGONAL METHOD COMPUTATION
     // ============================================
     
-    std::cout << "\nStarting profiled computation...\n";
-    std::cout << "Loading rotation keys on-demand during computation...\n\n";
-    
-    g_dram_counter.start();
+    // Start DRAM measurement
+    measurement.startDRAM();
     
     // Load input
     Ciphertext<DCRTPoly> cipherInput;
-    if (!Serial::DeserializeFromFile("data/input.bin", cipherInput, SerType::BINARY)) {
-        std::cerr << "Failed to load input\n";
+    if (!Serial::DeserializeFromFile(inputPath, cipherInput, SerType::BINARY)) {
+        std::cerr << "Failed to load input" << std::endl;
         return 1;
     }
     
-    PIN_MARKER_START();
+    // PIN markers around the computation
+    measurement.startPIN();
     
     // === SIMPLIFIED DIAGONAL METHOD WITH ON-DEMAND KEY LOADING ===
     // Compute: result = sum_k diag_k * rotate(input, k)
@@ -182,11 +241,12 @@ int main() {
         } else {
             // Load the specific rotation key for this k value
             std::stringstream filename;
-            filename << "data/rotation-key-k" << k << ".bin";
+            filename << "rotation-key-k" << k << ".bin";
+            std::string keyPath = tempDir.getDataPath(filename.str());
             
-            std::ifstream keyFile(filename.str(), std::ios::binary);
+            std::ifstream keyFile(keyPath, std::ios::binary);
             if (!cc->DeserializeEvalAutomorphismKey(keyFile, SerType::BINARY)) {
-                std::cerr << "Failed to load rotation key for k=" << k << "\n";
+                std::cerr << "Failed to load rotation key for k=" << k << std::endl;
                 return 1;
             }
             keyFile.close();
@@ -210,29 +270,35 @@ int main() {
         }
     }
     
-    PIN_MARKER_END();
+    measurement.endPIN();
     
     // Save result
-    if (!Serial::SerializeToFile("data/result.bin", result, SerType::BINARY)) {
-        std::cerr << "Failed to save result\n";
+    std::string resultPath = tempDir.getDataPath("result.bin");
+    if (!Serial::SerializeToFile(resultPath, result, SerType::BINARY)) {
+        std::cerr << "Failed to save result" << std::endl;
         return 1;
     }
     
-    g_dram_counter.stop();
-    g_dram_counter.print_results(true);
+    // Stop DRAM measurement
+    measurement.stopDRAM();
+    
+    // Print measurement results
+    measurement.printResults();
     
     // ============================================
-    // VERIFICATION
+    // VERIFICATION (OPTIONAL)
     // ============================================
     
-    std::cout << "\nDecrypting and verifying result...\n";
+    if (!quiet && !skipVerify) {
+        std::cout << "\nDecrypting and verifying result..." << std::endl;
+        
+        Plaintext resultPtxt;
+        cc->Decrypt(keyPair.secretKey, result, &resultPtxt);
+        resultPtxt->SetLength(numSlots);
+        
+        auto resultVec = resultPtxt->GetRealPackedValue();
+        verify_matrix_vector_result(resultVec, M, inputVec, matrixDim);
+    }
     
-    Plaintext resultPtxt;
-    cc->Decrypt(keyPair.secretKey, result, &resultPtxt);
-    resultPtxt->SetLength(numSlots);
-    
-    auto resultVec = resultPtxt->GetRealPackedValue();
-    verify_matrix_vector_result(resultVec, M, inputVec, matrixDim);
-
     return 0;
 }
