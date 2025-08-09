@@ -3,7 +3,6 @@
 #include "utils.hpp"
 #include <iostream>
 #include <vector>
-#include <omp.h>  // Add OpenMP header
 
 // Headers needed for serialization
 #include <ciphertext-ser.h>
@@ -14,7 +13,10 @@
 using namespace lbcrypto;
 
 int main(int argc, char* argv[]) {
-    // Parse command-line arguments
+    // ============================================
+    // PARSE ARGUMENTS AND SETUP
+    // ============================================
+    
     ArgParser parser;
     parser.parse(argc, argv);
     
@@ -23,38 +25,20 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     
-    // Setup measurement system
-    MeasurementMode mode = parser.getMeasurementMode();
+    // Get common parameters
     bool quiet = parser.getBool("quiet", false);
     bool skipVerify = parser.getBool("skip-verify", false);
     
-    // Set OpenMP threads if specified
-    uint32_t numThreads = parser.getUInt32("threads", 0);
-    if (numThreads > 0) {
-        omp_set_num_threads(numThreads);
-        if (!quiet) {
-            std::cout << "OpenMP threads set to: " << numThreads << std::endl;
-        }
-    }
+    // Initialize thread management
+    ThreadManager threads(parser);
+    threads.initialize();
     
-    // Report actual thread count being used
-    if (!quiet) {
-        #pragma omp parallel
-        {
-            #pragma omp single
-            {
-                std::cout << "OpenMP using " << omp_get_num_threads() << " threads" << std::endl;
-            }
-        }
-    }
-    
+    // Setup measurement system
+    MeasurementMode mode = parser.getMeasurementMode();
     MeasurementSystem measurement(mode, quiet);
     measurement.initialize();
-
-    // ============================================
-    // SETUP: Configure CKKS parameters
-    // ============================================
     
+    // Get benchmark parameters
     BenchmarkParams params = BenchmarkParams::fromArgs(parser);
     
     if (!quiet) {
@@ -62,18 +46,16 @@ int main(int argc, char* argv[]) {
         std::cout << "Measurement mode: " << measurement.getModeString() << "\n\n";
     }
     
+    // ============================================
+    // SETUP CKKS CRYPTOCONTEXT
+    // ============================================
+    
     CCParams<CryptoContextCKKSRNS> ccParams;
     ccParams.SetMultiplicativeDepth(params.multDepth);
     ccParams.SetScalingModSize(params.scaleModSize);
     ccParams.SetRingDim(params.ringDim);
+    ccParams.SetSecurityLevel(params.checkSecurity ? HEStd_128_classic : HEStd_NotSet);
     
-    if (params.checkSecurity) {
-        ccParams.SetSecurityLevel(HEStd_128_classic);
-    } else {
-        ccParams.SetSecurityLevel(HEStd_NotSet);
-    }
-    
-    // Create cryptocontext
     CryptoContext<DCRTPoly> cc = GenCryptoContext(ccParams);
     cc->Enable(PKE);
     cc->Enable(KEYSWITCH);
@@ -87,7 +69,7 @@ int main(int argc, char* argv[]) {
     auto keyPair = cc->KeyGen();
 
     // ============================================
-    // CREATE AND SERIALIZE INPUT CIPHERTEXTS
+    // PREPARE TEST DATA
     // ============================================
     
     std::vector<double> vec1 = {1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7};
@@ -106,13 +88,16 @@ int main(int argc, char* argv[]) {
     auto cipher1 = cc->Encrypt(keyPair.publicKey, ptxt1);
     auto cipher2 = cc->Encrypt(keyPair.publicKey, ptxt2);
 
-    // Create temporary directory
+    // ============================================
+    // SERIALIZE TO TEMPORARY FILES
+    // ============================================
+    
     TempDirectory tempDir;
     if (!tempDir.isValid()) {
+        std::cerr << "Failed to create temporary directory" << std::endl;
         return 1;
     }
 
-    // Serialize ciphertexts
     if (!quiet) {
         std::cout << "Serializing input ciphertexts..." << std::endl;
     }
@@ -141,7 +126,7 @@ int main(int argc, char* argv[]) {
     cipher2.reset();
 
     // ============================================
-    // PROFILED COMPUTATION
+    // PROFILED FHE COMPUTATION
     // ============================================
     
     // Start DRAM measurement (includes I/O)
@@ -160,17 +145,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // PIN markers directly around ONLY the FHE operation
-    if (mode == MeasurementMode::PIN_ONLY || mode == MeasurementMode::ALL) {
-        PIN_MARKER_START();
-    }
+    // PIN markers around ONLY the FHE operation
+    measurement.startPIN();
     
-    // Perform addition - the actual FHE operation!
+    // Perform homomorphic addition - the core FHE operation
     auto cipherResult = cc->EvalAdd(c1Loaded, c2Loaded);
     
-    if (mode == MeasurementMode::PIN_ONLY || mode == MeasurementMode::ALL) {
-        PIN_MARKER_END();
-    }
+    measurement.endPIN();
         
     // Serialize result
     if (!Serial::SerializeToFile(resultPath, cipherResult, SerType::BINARY)) {
@@ -185,7 +166,7 @@ int main(int argc, char* argv[]) {
     measurement.printResults();
     
     // ============================================
-    // VERIFICATION: Decrypt and check result
+    // VERIFICATION (OPTIONAL)
     // ============================================
     
     if (!quiet && !skipVerify) {
@@ -195,16 +176,17 @@ int main(int argc, char* argv[]) {
         cc->Decrypt(keyPair.secretKey, cipherResult, &result);
         result->SetLength(vec1.size());
         
-        std::cout.precision(8);
-        std::cout << "Result: " << result << std::endl;
+        // Get actual result vector
+        auto resultVec = result->GetRealPackedValue();
         
-        // Show expected values
-        std::cout << "Expected: (";
+        // Compute expected values
+        std::vector<double> expected;
         for (size_t i = 0; i < vec1.size(); i++) {
-            std::cout << vec1[i] + vec2[i];
-            if (i < vec1.size() - 1) std::cout << ", ";
+            expected.push_back(vec1[i] + vec2[i]);
         }
-        std::cout << ")" << std::endl;
+        
+        // Use the simple verification function
+        verifyResult(resultVec, expected);
     }
     
     return 0;
