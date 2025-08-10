@@ -23,9 +23,9 @@ extern "C" {
 
 // Measurement modes
 enum class MeasurementMode {
-    NONE,
-    DRAM_ONLY,
-    PIN_ONLY
+    LATENCY,
+    DRAM,
+    PIN
 };
 
 // Simple command-line argument parser
@@ -61,11 +61,15 @@ public:
         return (it != args.end()) ? (it->second == "true") : defaultVal;
     }
     
+    bool getDebug() const {
+        return getBool("debug", false);
+    }
+    
     MeasurementMode getMeasurementMode() const {
-        std::string mode = getString("measure", "none");
-        if (mode == "dram") return MeasurementMode::DRAM_ONLY;
-        if (mode == "pin") return MeasurementMode::PIN_ONLY;
-        return MeasurementMode::NONE;
+        std::string mode = getString("measure", "latency");
+        if (mode == "dram") return MeasurementMode::DRAM;
+        if (mode == "pin") return MeasurementMode::PIN;
+        return MeasurementMode::LATENCY;  // default
     }
 };
 
@@ -78,10 +82,10 @@ struct BenchmarkParams {
     
     static BenchmarkParams fromArgs(const ArgParser& parser) {
         return {
-            .ringDim = parser.getUInt32("ring-dim", 8192),
-            .multDepth = parser.getUInt32("mult-depth", 2),
-            .numDigits = parser.getUInt32("num-digits", 1),
-            .checkSecurity = parser.getBool("check-security", false)
+            .ringDim = parser.getUInt32("ring-dim"),
+            .multDepth = parser.getUInt32("mult-depth"),
+            .numDigits = parser.getUInt32("num-digits"),
+            .checkSecurity = parser.getBool("check-security")
         };
     }
 };
@@ -104,37 +108,37 @@ private:
     
 public:
     MeasurementSystem(MeasurementMode m) : mode(m) {
-        if (mode == MeasurementMode::DRAM_ONLY) {
+        if (mode == MeasurementMode::DRAM) {
             dramInitialized = dramCounter.init();
         }
     }
     
     void startDRAM() {
-        if (mode == MeasurementMode::DRAM_ONLY && dramInitialized) {
+        if (mode == MeasurementMode::DRAM && dramInitialized) {
             dramCounter.start();
         }
     }
     
     void stopDRAM() {
-        if (mode == MeasurementMode::DRAM_ONLY && dramInitialized) {
+        if (mode == MeasurementMode::DRAM && dramInitialized) {
             dramCounter.stop();
         }
     }
     
     void startPIN() {
-        if (mode == MeasurementMode::PIN_ONLY) {
+        if (mode == MeasurementMode::PIN) {
             PIN_MARKER_START();
         }
     }
     
     void endPIN() {
-        if (mode == MeasurementMode::PIN_ONLY) {
+        if (mode == MeasurementMode::PIN) {
             PIN_MARKER_END();
         }
     }
     
     void printResults() {
-        if (mode == MeasurementMode::DRAM_ONLY && dramInitialized) {
+        if (mode == MeasurementMode::DRAM && dramInitialized) {
             dramCounter.print_results();
         }
     }
@@ -232,35 +236,37 @@ std::map<int, std::vector<double>> extract_generalized_diagonals(
     return diagonals;
 }
 
-// Simple verification
-inline void verifyResult(const std::vector<double>& result, 
+// Simple verification - returns bool, prints only if debug
+inline bool verifyResult(const std::vector<double>& result, 
                         const std::vector<double>& expected,
-                        bool quiet = false) 
+                        bool debug = false) 
 {
-    if (quiet) return;
-    
     double maxError = 0.0;
     for (size_t i = 0; i < std::min(result.size(), expected.size()); i++) {
         maxError = std::max(maxError, std::abs(result[i] - expected[i]));
     }
     
-    if (maxError < 1e-6) {
-        std::cout << "✓ Verification PASSED\n";
-    } else {
-        std::cout << "⚠ Max error: " << maxError << "\n";
+    bool passed = (maxError < 1e-6);
+    
+    if (debug) {
+        if (passed) {
+            std::cout << "✓ Verification PASSED\n";
+        } else {
+            std::cout << "✗ Verification FAILED - Max error: " << maxError << "\n";
+        }
     }
+    
+    return passed;
 }
 
-// Matrix-vector verification
-inline void verify_matrix_vector_result(
+// Matrix-vector verification - returns bool, prints only if debug
+inline bool verify_matrix_vector_result(
     const std::vector<double>& result,
     const std::vector<std::vector<double>>& M,
     const std::vector<double>& input,
     std::size_t matrixDim,
-    bool quiet = false) 
+    bool debug = false) 
 {
-    if (quiet) return;
-    
     std::vector<double> expected(M.size(), 0.0);
     for (std::size_t i = 0; i < matrixDim; ++i) {
         for (std::size_t j = 0; j < matrixDim; ++j) {
@@ -268,7 +274,7 @@ inline void verify_matrix_vector_result(
         }
     }
     
-    verifyResult(result, expected, quiet);
+    return verifyResult(result, expected, debug);
 }
 
 // Rotate vector (matches OpenFHE's EvalRotate direction)
@@ -294,7 +300,6 @@ inline std::vector<double> rotate(const std::vector<double>& vec, int k) {
 inline std::vector<double> rotateVectorDown(const std::vector<double>& vec, int k) {
     return rotate(vec, -k);
 }
-
 
 // Convert diagonal index from [0, slots-1] to signed range [-slots/2, slots/2]
 // This treats the second half of slots as negative indices

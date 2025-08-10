@@ -18,8 +18,7 @@ int main(int argc, char* argv[]) {
     parser.parse(argc, argv);
     
     // Get parameters
-    bool quiet = parser.getBool("quiet", false);
-    bool skipVerify = parser.getBool("skip-verify", false);
+    bool debug = parser.getDebug();
     int32_t rotationIndex = static_cast<int32_t>(parser.getUInt32("rotation-index", 1));
     setupThreads(parser);
     
@@ -51,8 +50,12 @@ int main(int argc, char* argv[]) {
     std::vector<int32_t> rotationIndices = {rotationIndex};
     cc->EvalRotateKeyGen(keyPair.secretKey, rotationIndices);
 
-    // Prepare test data
+    // Get number of slots
+    uint32_t numSlots = cc->GetEncodingParams()->GetBatchSize();
+    
+    // Prepare test data 
     std::vector<double> vec = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
+    vec.resize(numSlots, 0.0); 
     
     // Encode as plaintext
     Plaintext ptxt = cc->MakeCKKSPackedPlaintext(vec);
@@ -130,21 +133,17 @@ int main(int argc, char* argv[]) {
     // Print measurement results
     measurement.printResults();
     
-    // Verification (optional)
-    if (!skipVerify) {
-        Plaintext result;
-        cc->Decrypt(keyPair.secretKey, cipherResult, &result);
-        result->SetLength(vec.size());
-        
-        // Get actual result vector
-        auto resultVec = result->GetRealPackedValue();
-        
-        // Use rotate function that matches OpenFHE's direction
-        auto expected = rotate(vec, rotationIndex);
-        
-        // Verify
-        verifyResult(resultVec, expected, quiet);
-    }
+    // Always verify
+    Plaintext result;
+    cc->Decrypt(keyPair.secretKey, cipherResult, &result);
+    result->SetLength(numSlots);
     
-    return 0;
+    // Get actual result vector
+    auto resultVec = result->GetRealPackedValue();
+    
+    // Use rotate function that matches OpenFHE's direction
+    auto expected = rotate(vec, rotationIndex);
+    
+    // Verify and return exit code
+    return verifyResult(resultVec, expected, debug) ? 0 : 1;
 }

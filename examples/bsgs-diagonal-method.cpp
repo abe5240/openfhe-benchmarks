@@ -19,15 +19,13 @@
 
 using namespace lbcrypto;
 
-
 int main(int argc, char* argv[]) {
     // Parse arguments
     ArgParser parser;
     parser.parse(argc, argv);
     
     // Get parameters
-    bool quiet = parser.getBool("quiet", false);
-    bool skipVerify = parser.getBool("skip-verify", false);
+    bool debug = parser.getDebug();
     std::size_t matrixDim = static_cast<std::size_t>(parser.getUInt32("matrix-dim", 128));
     setupThreads(parser);
     
@@ -57,7 +55,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    if (!quiet) {
+    if (debug) {
         std::cout << "=== Baby-Step/Giant-Step (BSGS) Method with Signed Indexing ===\n";
         std::cout << "Actual matrix dimension: " << matrixDim << "×" << matrixDim << "\n";
         std::cout << "Number of slots: " << numSlots << "\n";
@@ -67,25 +65,19 @@ int main(int argc, char* argv[]) {
     // Generate key pair
     auto keyPair = cc->KeyGen();
     
-    // ============================================
     // CREATE MATRIX AND VECTOR
-    // ============================================
-    
-    // Create embedded random matrix
     auto M = make_embedded_random_matrix(matrixDim, numSlots);
     auto inputVec = make_random_input_vector(matrixDim, numSlots);
     
-    // ============================================
     // EXTRACT DIAGONALS AND CONVERT TO SIGNED INDEXING
-    // ============================================
-    
-    if (!quiet) std::cout << "Extracting diagonals...\n";
+    if (debug) {
+        std::cout << "Extracting diagonals...\n";
+    }
     
     // First extract diagonals with regular indexing [0, numSlots-1]
     auto diagonalsUnsigned = extract_generalized_diagonals(M, matrixDim);
     
     // Convert to signed indexing [-numSlots/2, numSlots/2]
-    // This allows us to treat the slot ring symmetrically
     std::map<int, std::vector<double>> diagonalsSigned;
     
     for (const auto& entry : diagonalsUnsigned) {
@@ -95,52 +87,44 @@ int main(int argc, char* argv[]) {
     }
     
     int numDiagonals = static_cast<int>(diagonalsSigned.size());
-    if (!quiet) {
+    if (debug) {
         std::cout << "Found " << numDiagonals << " non-empty diagonals\n";
         std::cout << "Diagonal indices range from " << diagonalsSigned.begin()->first 
                   << " to " << diagonalsSigned.rbegin()->first << "\n";
     }
     
-    // ============================================
     // BSGS PARAMETERS BASED ON ACTUAL DIAGONAL COUNT
-    // ============================================
-    
-    // Choose n1 based on the actual number of diagonals (not numSlots!)
-    // This is much more efficient for sparse matrices
     int n1 = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(numDiagonals))));
     
     // Ensure n1 is reasonable
     if (n1 < 1) n1 = 1;
     if (n1 > numSlots) n1 = numSlots;
     
-    // n2 is informational - we don't actually need it as a fixed bound
     int n2_approx = static_cast<int>(std::ceil(static_cast<double>(numSlots) / n1));
     
-    if (!quiet) {
+    if (debug) {
         std::cout << "BSGS parameters: n1 = " << n1 
                   << " (based on sqrt(" << numDiagonals << ")), n2 ≈ " << n2_approx << "\n";
     }
     
-    // ============================================
     // DECOMPOSE DIAGONALS AND PRE-ROTATE
-    // ============================================
+    if (debug) {
+        std::cout << "Pre-rotating diagonals for BSGS decomposition...\n";
+    }
 
-    if (!quiet) std::cout << "Pre-rotating diagonals for BSGS decomposition...\n";
-
-    // Track which baby steps (i) and giant steps (j) we actually use
-    std::set<int> usedBabySteps;   // i ∈ [0, n1)
-    std::set<int> usedGiantSteps;  // j can be negative!
+    // Track which baby steps and giant steps we actually use
+    std::set<int> usedBabySteps;
+    std::set<int> usedGiantSteps;
     
     // Pre-rotate each diagonal by its giant step amount
     std::map<int, Plaintext> preRotateDiagonals;
     
     for (const auto& entry : diagonalsSigned) {
-        int k = entry.first;  // Signed diagonal index
+        int k = entry.first;
         
         // Decompose k = j*n1 + i where i ∈ [0, n1)
-        // Use floor division to handle negative k correctly
         int j = floorDivision(k, n1);
-        int i = k - j * n1;  // This ensures i ∈ [0, n1) even for negative k
+        int i = k - j * n1;
         
         usedBabySteps.insert(i);
         usedGiantSteps.insert(j);
@@ -148,35 +132,31 @@ int main(int argc, char* argv[]) {
         // Pre-rotate the diagonal by j*n1 positions
         auto diagonal = entry.second;
         int rotateAmount = (n1 * j) % numSlots;
-        if (rotateAmount < 0) rotateAmount += numSlots;  // Ensure positive rotation
+        if (rotateAmount < 0) rotateAmount += numSlots;
         diagonal = rotateVectorDown(diagonal, rotateAmount);
         
         // Store with original signed key k
         preRotateDiagonals[k] = cc->MakeCKKSPackedPlaintext(diagonal);
     }
     
-    if (!quiet) {
+    if (debug) {
         std::cout << "Baby steps used: " << usedBabySteps.size() 
                   << ", Giant steps used: " << usedGiantSteps.size() << "\n";
         std::cout << "Giant step range: [" << *usedGiantSteps.begin() 
                   << ", " << *usedGiantSteps.rbegin() << "]\n";
     }
     
-    // ============================================
     // CREATE TEMPORARY DIRECTORY FOR FILES
-    // ============================================
-    
     TempDirectory tempDir;
     if (!tempDir.isValid()) {
         std::cerr << "Failed to create temporary directory" << std::endl;
         return 1;
     }
     
-    // ============================================
     // GENERATE AND SAVE ROTATION KEYS
-    // ============================================
-    
-    if (!quiet) std::cout << "Generating rotation keys...\n";
+    if (debug) {
+        std::cout << "Generating rotation keys...\n";
+    }
     
     // Collect all needed rotations
     std::set<int> rotationIndices;
@@ -211,15 +191,14 @@ int main(int argc, char* argv[]) {
         cc->ClearEvalAutomorphismKeys();
     }
     
-    if (!quiet) {
+    if (debug) {
         std::cout << "Generated and saved " << rotationIndices.size() << " rotation keys\n";
     }
     
-    // ============================================
     // ENCRYPT INPUT
-    // ============================================
-    
-    if (!quiet) std::cout << "Encrypting input...\n";
+    if (debug) {
+        std::cout << "Encrypting input...\n";
+    }
     
     Plaintext inputPtxt = cc->MakeCKKSPackedPlaintext(inputVec);
     auto inputCipher = cc->Encrypt(keyPair.publicKey, inputPtxt);
@@ -232,11 +211,10 @@ int main(int argc, char* argv[]) {
     
     inputCipher.reset();
 
-    // ============================================
     // PROFILED BSGS COMPUTATION
-    // ============================================
-    
-    if (!quiet) std::cout << "\nStarting profiled BSGS computation...\n";
+    if (debug) {
+        std::cout << "\nStarting profiled BSGS computation...\n";
+    }
     
     // Start DRAM measurement
     measurement.startDRAM();
@@ -251,7 +229,7 @@ int main(int argc, char* argv[]) {
     // PIN markers around the computation
     measurement.startPIN();
     
-    // === BSGS COMPUTATION WITH CACHED BABY ROTATIONS ===
+    // BSGS COMPUTATION WITH CACHED BABY ROTATIONS
     
     // Cache for baby rotations (compute on first use)
     std::vector<Ciphertext<DCRTPoly>> babyRotationCache(n1);
@@ -284,8 +262,7 @@ int main(int argc, char* argv[]) {
         return babyRotationCache[i];
     };
     
-    // Process giant steps in sorted order (from negative to positive)
-    // This ensures consistent numerical behavior
+    // Process giant steps in sorted order
     std::vector<int> sortedGiantSteps(usedGiantSteps.begin(), usedGiantSteps.end());
     std::sort(sortedGiantSteps.begin(), sortedGiantSteps.end());
     
@@ -293,7 +270,6 @@ int main(int argc, char* argv[]) {
     bool first = true;
     
     for (int j : sortedGiantSteps) {
-        
         // Accumulate all baby steps for this giant block
         Ciphertext<DCRTPoly> giantBlockSum;
         bool giantBlockFirst = true;
@@ -327,7 +303,7 @@ int main(int argc, char* argv[]) {
         
         // Apply giant rotation if j ≠ 0
         if (j != 0) {
-            int giantRotation = n1 * j;  // Can be negative!
+            int giantRotation = n1 * j;
             
             // Load rotation key
             std::stringstream filename;
@@ -369,20 +345,17 @@ int main(int argc, char* argv[]) {
     // Print measurement results
     measurement.printResults();
     
-    // ============================================
-    // VERIFICATION
-    // ============================================
-    
-    if (!skipVerify) {
-        if (!quiet) std::cout << "\nDecrypting and verifying result...\n";
-        
-        Plaintext resultPtxt;
-        cc->Decrypt(keyPair.secretKey, result, &resultPtxt);
-        resultPtxt->SetLength(numSlots);
-        
-        auto resultVec = resultPtxt->GetRealPackedValue();
-        verify_matrix_vector_result(resultVec, M, inputVec, matrixDim, quiet);
+    // Always verify
+    if (debug) {
+        std::cout << "\nDecrypting and verifying result...\n";
     }
-
-    return 0;
+    
+    Plaintext resultPtxt;
+    cc->Decrypt(keyPair.secretKey, result, &resultPtxt);
+    resultPtxt->SetLength(numSlots);
+    
+    auto resultVec = resultPtxt->GetRealPackedValue();
+    
+    // Verify and return exit code
+    return verify_matrix_vector_result(resultVec, M, inputVec, matrixDim, debug) ? 0 : 1;
 }

@@ -23,8 +23,7 @@ int main(int argc, char* argv[]) {
     parser.parse(argc, argv);
     
     // Get parameters
-    bool quiet = parser.getBool("quiet", false);
-    bool skipVerify = parser.getBool("skip-verify", false);
+    bool debug = parser.getDebug();
     std::size_t matrixDim = static_cast<std::size_t>(parser.getUInt32("matrix-dim", 128));
     setupThreads(parser);
     
@@ -54,7 +53,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    if (!quiet) {
+    if (debug) {
         std::cout << "=== Single-Hoisted Diagonal Method for Matrix-Vector Multiplication ===\n";
         std::cout << "Actual matrix dimension: " << matrixDim << "×" << matrixDim << "\n";
         std::cout << "Number of slots: " << numSlots << "\n";
@@ -65,26 +64,19 @@ int main(int argc, char* argv[]) {
     // Generate key pair
     auto keyPair = cc->KeyGen();
     
-    // ============================================
-    // CREATE MATRIX AND VECTOR
-    // ============================================
-    
     // Create embedded random matrix and input vector
     auto M = make_embedded_random_matrix(matrixDim, numSlots);
     auto inputVec = make_random_input_vector(matrixDim, numSlots);
 
-    // ============================================
-    // EXTRACT AND ENCODE ALL NON-EMPTY DIAGONALS
-    // ============================================
-    
-    if (!quiet) std::cout << "Extracting diagonals...\n";
-    
     // Extract all non-empty diagonals
     auto diagonals = extract_generalized_diagonals(M, matrixDim);
-    if (!quiet) std::cout << "Found " << diagonals.size() << " non-empty diagonals\n";
+    
+    if (debug) {
+        std::cout << "Extracting diagonals...\n";
+        std::cout << "Found " << diagonals.size() << " non-empty diagonals\n";
+    }
     
     // Build parallel vectors for efficient access during computation
-    // rotationIndexList[i] corresponds to diagonalPlaintextList[i]
     std::vector<int32_t> rotationIndexList;
     std::vector<Plaintext> diagonalPlaintextList;
     
@@ -114,7 +106,7 @@ int main(int argc, char* argv[]) {
     }
     
     // Generate and save rotation keys individually
-    if (!quiet) {
+    if (debug) {
         std::cout << "Generating and saving " << rotationsNeeded.size() << " rotation keys individually...\n";
     }
     
@@ -138,7 +130,7 @@ int main(int argc, char* argv[]) {
         cc->ClearEvalAutomorphismKeys();
     }
     
-    if (!quiet) {
+    if (debug) {
         std::cout << "Saved " << rotationsNeeded.size() << " rotation key files\n";
     }
     
@@ -146,11 +138,10 @@ int main(int argc, char* argv[]) {
     Plaintext inputPtxt = cc->MakeCKKSPackedPlaintext(inputVec);
     auto inputCipher = cc->Encrypt(keyPair.publicKey, inputPtxt);
 
-    // ============================================
-    // SERIALIZE INPUT
-    // ============================================
-    
-    if (!quiet) std::cout << "Serializing input...\n";
+    // Serialize input
+    if (debug) {
+        std::cout << "Serializing input...\n";
+    }
     
     std::string inputPath = tempDir.getFilePath("input.bin");
     if (!Serial::SerializeToFile(inputPath, inputCipher, SerType::BINARY)) {
@@ -160,11 +151,9 @@ int main(int argc, char* argv[]) {
     
     inputCipher.reset();
 
-    // ============================================
     // PROFILED HOISTED DIAGONAL METHOD COMPUTATION
-    // ============================================
     
-    if (!quiet) {
+    if (debug) {
         std::cout << "\nStarting profiled computation...\n";
         std::cout << "Will load rotation keys on-demand during computation...\n\n";
     }
@@ -182,17 +171,17 @@ int main(int argc, char* argv[]) {
     // PIN markers around the computation
     measurement.startPIN();
     
-    // === SINGLE-HOISTED DIAGONAL METHOD WITH ON-DEMAND KEY LOADING ===
+    // SINGLE-HOISTED DIAGONAL METHOD WITH ON-DEMAND KEY LOADING
     // Step 1: Precompute rotation digits once (hoisting optimization)
-    // This allows us to reuse the expensive digit decomposition across all rotations
-    if (!quiet) std::cout << "Precomputing rotation digits for hoisting...\n";
+    if (debug) {
+        std::cout << "Precomputing rotation digits for hoisting...\n";
+    }
     auto precomputedDigits = cc->EvalFastRotationPrecompute(cipherInput);
     
     // Step 2: Get cyclotomic order (needed by EvalFastRotation)
     uint32_t cyclotomicOrder = 2 * cc->GetRingDimension();
     
     // Step 3: Compute result = sum_k diag_k * rotate(input, k)
-    // Using hoisted rotations with on-demand key loading
     Ciphertext<DCRTPoly> result;
     bool first = true;
     
@@ -252,20 +241,17 @@ int main(int argc, char* argv[]) {
     // Print measurement results
     measurement.printResults();
     
-    // ============================================
-    // VERIFICATION
-    // ============================================
-    
-    if (!skipVerify) {
-        if (!quiet) std::cout << "\nDecrypting and verifying result...\n";
-        
-        Plaintext resultPtxt;
-        cc->Decrypt(keyPair.secretKey, result, &resultPtxt);
-        resultPtxt->SetLength(numSlots);
-        
-        auto resultVec = resultPtxt->GetRealPackedValue();
-        verify_matrix_vector_result(resultVec, M, inputVec, matrixDim, quiet);
+    // Always verify
+    if (debug) {
+        std::cout << "\nDecrypting and verifying result...\n";
     }
-
-    return 0;
+    
+    Plaintext resultPtxt;
+    cc->Decrypt(keyPair.secretKey, result, &resultPtxt);
+    resultPtxt->SetLength(numSlots);
+    
+    auto resultVec = resultPtxt->GetRealPackedValue();
+    
+    // Verify and return exit code
+    return verify_matrix_vector_result(resultVec, M, inputVec, matrixDim, debug) ? 0 : 1;
 }

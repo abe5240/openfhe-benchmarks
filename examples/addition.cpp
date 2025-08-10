@@ -18,8 +18,7 @@ int main(int argc, char* argv[]) {
     parser.parse(argc, argv);
     
     // Get parameters
-    bool quiet = parser.getBool("quiet", false);
-    bool skipVerify = parser.getBool("skip-verify", false);
+    bool debug = parser.getDebug();
     setupThreads(parser);
     
     MeasurementMode mode = parser.getMeasurementMode();
@@ -119,24 +118,20 @@ int main(int argc, char* argv[]) {
     // Print measurement results
     measurement.printResults();
     
-    // Verification (optional)
-    if (!skipVerify) {
-        Plaintext result;
-        cc->Decrypt(keyPair.secretKey, cipherResult, &result);
-        result->SetLength(vec1.size());
-        
-        // Get actual result vector
-        auto resultVec = result->GetRealPackedValue();
-        
-        // Compute expected values
-        std::vector<double> expected;
-        for (size_t i = 0; i < vec1.size(); i++) {
-            expected.push_back(vec1[i] + vec2[i]);
-        }
-        
-        // Verify
-        verifyResult(resultVec, expected, quiet);
+    // Always verify
+    Plaintext result;
+    cc->Decrypt(keyPair.secretKey, cipherResult, &result);
+    result->SetLength(vec1.size());
+    
+    // Get actual result vector
+    auto resultVec = result->GetRealPackedValue();
+    
+    // Compute expected values
+    std::vector<double> expected;
+    for (size_t i = 0; i < vec1.size(); i++) {
+        expected.push_back(vec1[i] + vec2[i]);
     }
     
-    return 0;
+    // Verify and return exit code
+    return verifyResult(resultVec, expected, debug) ? 0 : 1;
 }

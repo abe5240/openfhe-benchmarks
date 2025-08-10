@@ -23,8 +23,7 @@ int main(int argc, char* argv[]) {
     parser.parse(argc, argv);
     
     // Get parameters
-    bool quiet = parser.getBool("quiet", false);
-    bool skipVerify = parser.getBool("skip-verify", false);
+    bool debug = parser.getDebug();
     std::size_t matrixDim = static_cast<std::size_t>(parser.getUInt32("matrix-dim", 128));
     setupThreads(parser);
     
@@ -54,7 +53,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (!quiet) {
+    if (debug) {
         std::cout << "=== Diagonal Method for Matrix-Vector Multiplication ===\n";
         std::cout << "Matrix dimension: " << matrixDim << "x" << matrixDim << "\n";
         std::cout << "Number of slots: " << numSlots << "\n";
@@ -71,7 +70,7 @@ int main(int argc, char* argv[]) {
     // Extract all non-empty diagonals
     auto diagonals = extract_generalized_diagonals(M, matrixDim);
     
-    if (!quiet) {
+    if (debug) {
         std::cout << "Found " << diagonals.size() << " non-empty diagonals\n";
     }
     
@@ -208,15 +207,13 @@ int main(int argc, char* argv[]) {
     // Print measurement results
     measurement.printResults();
     
-    // Verification (optional)
-    if (!skipVerify) {
-        Plaintext resultPtxt;
-        cc->Decrypt(keyPair.secretKey, result, &resultPtxt);
-        resultPtxt->SetLength(numSlots);
-        
-        auto resultVec = resultPtxt->GetRealPackedValue();
-        verify_matrix_vector_result(resultVec, M, inputVec, matrixDim, quiet);
-    }
+    // Always verify
+    Plaintext resultPtxt;
+    cc->Decrypt(keyPair.secretKey, result, &resultPtxt);
+    resultPtxt->SetLength(numSlots);
     
-    return 0;
+    auto resultVec = resultPtxt->GetRealPackedValue();
+    
+    // Verify and return exit code
+    return verify_matrix_vector_result(resultVec, M, inputVec, matrixDim, debug) ? 0 : 1;
 }

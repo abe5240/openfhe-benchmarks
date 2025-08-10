@@ -25,25 +25,20 @@ class Benchmarker:
     including timing, memory traffic, and instruction counts.
     """
     
-    # ============================================================================
-    # Initialization
-    # ============================================================================
-    
-    def __init__(self):
-        """Initialize the benchmarker with paths and default configuration."""
+    def __init__(self, debug=False):
+        """Initialize the benchmarker with debug control."""
+        self._debug = debug
         self._setup_paths()
         self._setup_default_config()
     
     def _setup_paths(self):
         """Configure all necessary paths for benchmarking tools."""
-        # Determine repository root based on script location
         current_file = Path(__file__).resolve()
         if current_file.parent.name == "plots":
             self.repo_root = current_file.parent.parent
         else:
             self.repo_root = current_file.parent
         
-        # Build and tool paths
         self.build_dir = self.repo_root / "build"
         self.pin_path = Path("/opt/intel/pin/pin")
         self.pintool_path = Path("/opt/profiling-tools/lib/pintool.so")
@@ -51,42 +46,36 @@ class Benchmarker:
     def _setup_default_config(self):
         """Set up the default configuration for all benchmarks."""
         self.base_config = {
-            # Core parameters
             "ring_dim": 8192,
-            "mult_depth": 1,
-            "num_digits": 2,
-            "threads": 1,
-            
-            # Security and verification
-            "check_security": False,
-            "skip_verify": True,
-            
-            # Execution settings
-            "timing_runs": 3,
-            "build": True,
-            "quiet": True,
-            
-            # Additional parameters (may not be used by all benchmarks)
+            "num_limbs": 2,
+            "num_digits": 1,
             "matrix_dim": 128,
+            "threads": 1,
+            "timing_runs": 5,
+            "check_security": False,
+            "build": True,
+            "debug": False,
         }
     
-    # ============================================================================
-    # Build Management
-    # ============================================================================
-    
-    def build(self, benchmark):
+    def build(self, benchmark, clean=False):
         """
         Build a benchmark executable from source.
         
         Args:
             benchmark: Name of the benchmark to build
+            clean: If True, force a clean rebuild
             
         Returns:
             Path to the built executable
         """
         self.build_dir.mkdir(exist_ok=True)
         
-        # Configure with CMake
+        # Optionally remove existing binary
+        if clean:
+            binary_path = self.build_dir / benchmark
+            if binary_path.exists():
+                binary_path.unlink()
+        
         subprocess.run(
             [
                 "cmake",
@@ -96,25 +85,21 @@ class Benchmarker:
                 "-DCMAKE_BUILD_TYPE=Release"
             ],
             check=True,
-            capture_output=True
+            capture_output=not self._debug
         )
         
-        # Build with all available cores
-        subprocess.run(
-            [
-                "cmake",
-                "--build", str(self.build_dir),
-                "-j", str(os.cpu_count())
-            ],
-            check=True,
-            capture_output=True
-        )
+        # Add --clean-first to force rebuild
+        build_cmd = [
+            "cmake",
+            "--build", str(self.build_dir),
+            "-j", str(os.cpu_count())
+        ]
+        if clean:
+            build_cmd.insert(2, "--clean-first")
+        
+        subprocess.run(build_cmd, check=True, capture_output=not self._debug)
         
         return self.build_dir / benchmark
-    
-    # ============================================================================
-    # Measurement Functions
-    # ============================================================================
     
     def measure_latency(self, target, args, runs=3):
         """
@@ -128,18 +113,12 @@ class Benchmarker:
         Returns:
             Tuple of (mean_time, standard_deviation) or (None, None) on failure
         """
-        cmd = [
-            str(target),
-            *args,
-            "--measure=none",
-            "--skip-verify=true"
-        ]
+        cmd = [str(target), *args, "--measure=latency"]
         
         times = []
         for _ in range(runs):
             start = time.perf_counter()
-            # Don't capture output - let the quiet flag control visibility
-            result = subprocess.run(cmd, stderr=subprocess.DEVNULL)
+            result = subprocess.run(cmd, capture_output=not self._debug)
             
             if result.returncode == 0:
                 elapsed = time.perf_counter() - start
@@ -161,20 +140,13 @@ class Benchmarker:
         Returns:
             Dictionary with READ/WRITE/TOTAL bytes, or None on failure
         """
-        cmd = [
-            "sudo", "-n",
-            str(target),
-            *args,
-            "--measure=dram",
-            "--skip-verify=true"
-        ]
+        cmd = ["sudo", "-n", str(target), *args, "--measure=dram"]
         
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
             return None
         
-        # Parse DRAM statistics from output
         data = {}
         for line in result.stdout.split('\n'):
             if 'DRAM_' in line and '=' in line:
@@ -186,6 +158,13 @@ class Benchmarker:
     def measure_opcounts(self, target, args):
         """
         Measure integer operations using Intel PIN instrumentation.
+        
+        Args:
+            target: Path to the executable
+            args: Command line arguments
+            
+        Returns:
+            Dictionary with operation counts, or None on failure
         """
         cmd = [
             "sudo", "-n",
@@ -194,8 +173,7 @@ class Benchmarker:
             "--",
             str(target),
             *args,
-            "--measure=pin",
-            "--skip-verify=true"
+            "--measure=pin"
         ]
         
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -203,7 +181,6 @@ class Benchmarker:
         if result.returncode != 0:
             return None
         
-        # Extract JSON from output (it might have other text around it)
         json_match = re.search(r'\{[^}]+\}', result.stdout)
         if json_match:
             try:
@@ -212,10 +189,6 @@ class Benchmarker:
                 pass
         
         return None
-    
-    # ============================================================================
-    # Main Execution
-    # ============================================================================
     
     def run(self, benchmark, **kwargs):
         """
@@ -228,38 +201,44 @@ class Benchmarker:
         Returns:
             Dictionary containing all measurement results and computed metrics
         """
-        # Merge base configuration with overrides
         params = self.base_config.copy()
         params.update(kwargs)
+        params["debug"] = self._debug
+            
+        # Validate ring dimension
+        if params["ring_dim"] < 16:
+            raise ValueError(f"Ring dimension must be at least 16, got {params['ring_dim']}")
         
-        # Build or locate executable
         if params["build"]:
-            target = self.build(benchmark)
+            clean = params.get("clean_build", False)
+            target = self.build(benchmark, clean=clean)
         else:
             target = self.build_dir / benchmark
         
-        # Convert parameters to command line arguments
         args = self._prepare_arguments(params)
         
-        # Perform all measurements
-        results = {
+        latency = self.measure_latency(target, args, params["timing_runs"])
+        dram = self.measure_dram(target, args)
+        opcounts = self.measure_opcounts(target, args)
+        
+        success = latency[0] is not None
+        
+        ai = None
+        if dram and opcounts:
+            total_bytes = dram.get("DRAM_TOTAL_BYTES", 0)
+            total_ops = opcounts.get("total", 0)
+            if total_bytes > 0:
+                ai = total_ops / total_bytes
+        
+        return {
             "benchmark": benchmark,
             "parameters": params,
-            "latency": self.measure_latency(
-                target, args, params["timing_runs"]
-            ),
-            "dram": self.measure_dram(target, args),
-            "opcounts": self.measure_opcounts(target, args)
+            "success": success,
+            "latency": latency,
+            "dram": dram,
+            "opcounts": opcounts,
+            "ai": ai
         }
-        
-        # Calculate arithmetic intensity if data is available
-        self._calculate_arithmetic_intensity(results)
-        
-        return results
-    
-    # ============================================================================
-    # Helper Methods
-    # ============================================================================
     
     def _prepare_arguments(self, params):
         """
@@ -271,29 +250,20 @@ class Benchmarker:
         Returns:
             List of command line argument strings
         """
-        # Skip internal parameters (those starting with _) and control flags
-        skip_keys = {"timing_runs", "build"}
+        skip_keys = {"timing_runs", "build", "num_limbs", "clean_build"}
         
         args = []
+        
+        if "num_limbs" in params:
+            mult_depth = params["num_limbs"] - 1
+            args.append(f"--mult-depth={mult_depth}")
+        
         for key, value in params.items():
             if key not in skip_keys and not key.startswith("_"):
                 arg_name = key.replace("_", "-")
-                args.append(f"--{arg_name}={value}")
+                if isinstance(value, bool):
+                    args.append(f"--{arg_name}={'true' if value else 'false'}")
+                else:
+                    args.append(f"--{arg_name}={value}")
         
         return args
-    
-    def _calculate_arithmetic_intensity(self, results):
-        """
-        Calculate arithmetic intensity (ops/byte) if data is available.
-        
-        Args:
-            results: Dictionary to update with AI metric
-        """
-        if not (results["dram"] and results["opcounts"]):
-            return
-        
-        total_bytes = results["dram"].get("DRAM_TOTAL_BYTES", 0)
-        total_ops = results["opcounts"].get("total", 0)
-        
-        if total_bytes > 0:
-            results["ai"] = total_ops / total_bytes
