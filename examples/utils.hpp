@@ -79,37 +79,19 @@ struct BenchmarkParams {
     static BenchmarkParams fromArgs(const ArgParser& parser) {
         return {
             .ringDim = parser.getUInt32("ring-dim", 8192),
-            .multDepth = parser.getUInt32("mult-depth", 4),
+            .multDepth = parser.getUInt32("mult-depth", 2),
             .numDigits = parser.getUInt32("num-digits", 1),
             .checkSecurity = parser.getBool("check-security", false)
         };
     }
 };
 
-// Thread setup with verification
+// Thread setup
 inline void setupThreads(const ArgParser& parser) {
     uint32_t requested = parser.getUInt32("threads", 0);
-    bool quiet = parser.getBool("quiet", false);
-    MeasurementMode mode = parser.getMeasurementMode();
     
     if (requested > 0) {
         omp_set_num_threads(requested);
-    }
-    
-    // Only report in latency mode (measure=none) to avoid repetition
-    if (!quiet && mode == MeasurementMode::NONE) {
-        #pragma omp parallel
-        {
-            #pragma omp single
-            {
-                uint32_t actual = omp_get_num_threads();
-                std::cout << "THREADS_ACTUAL=" << actual << std::endl;
-                if (requested > 0 && actual != requested) {
-                    std::cerr << "WARNING: Requested " << requested 
-                              << " threads but got " << actual << std::endl;
-                }
-            }
-        }
     }
 }
 
@@ -216,31 +198,37 @@ inline std::vector<double> make_random_input_vector(
     return vec;
 }
 
-// Extract generalized diagonals from matrix
-inline std::map<int, std::vector<double>> extract_generalized_diagonals(
-    const std::vector<std::vector<double>>& M, std::size_t matrixDim) 
+std::map<int, std::vector<double>> extract_generalized_diagonals(
+    const std::vector<std::vector<double>>& M, 
+    std::size_t matrixDim) 
 {
     std::size_t numSlots = M.size();
     std::map<int, std::vector<double>> diagonals;
     
+    // For each possible diagonal offset k
     for (std::size_t k = 0; k < numSlots; ++k) {
         std::vector<double> diag(numSlots, 0.0);
         bool hasNonZero = false;
         
+        // Extract the k-th generalized diagonal
         for (std::size_t j = 0; j < matrixDim; ++j) {
             for (std::size_t i = 0; i < matrixDim; ++i) {
+                // Generalized diagonal: elements where (j - i) mod numSlots = k
                 if ((j + numSlots - i) % numSlots == k) {
-                    std::size_t idx = (i + k) % numSlots;
-                    diag[idx] = M[i][j];
-                    if (M[i][j] != 0.0) hasNonZero = true;
+                    diag[i] = M[i][j];  // FIX: Place at position i, not (i+k)
+                    if (M[i][j] != 0.0) {
+                        hasNonZero = true;
+                    }
                 }
             }
         }
         
+        // Only store non-empty diagonals
         if (hasNonZero) {
             diagonals[k] = diag;
         }
     }
+    
     return diagonals;
 }
 
@@ -281,4 +269,54 @@ inline void verify_matrix_vector_result(
     }
     
     verifyResult(result, expected, quiet);
+}
+
+// Rotate vector (matches OpenFHE's EvalRotate direction)
+// Positive index = rotate left, negative index = rotate right
+inline std::vector<double> rotate(const std::vector<double>& vec, int k) {
+    std::size_t n = vec.size();
+    if (n == 0) return vec;
+    
+    // Normalize k to be in range [0, n)
+    k = k % (int)n;
+    if (k < 0) k += n;
+    
+    std::vector<double> result(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        // Rotating left by k means element at position i comes from position (i+k)%n
+        result[i] = vec[(i + k) % n];
+    }
+    return result;
+}
+
+// Rotate vector down by k positions (helper for pre-shifting diagonals)
+// This is equivalent to rotating right by k, which is rotating left by -k
+inline std::vector<double> rotateVectorDown(const std::vector<double>& vec, int k) {
+    return rotate(vec, -k);
+}
+
+
+// Convert diagonal index from [0, slots-1] to signed range [-slots/2, slots/2]
+// This treats the second half of slots as negative indices
+// Example: in 64 slots, index 63 becomes -1 (one step backwards)
+int normalizeToSignedIndex(int k, int numSlots) {
+    int halfSlots = numSlots / 2;
+    if (k <= halfSlots) {
+        return k;  // First half stays positive
+    } else {
+        return k - numSlots;  // Second half becomes negative
+    }
+}
+
+// Floor division that works correctly for negative numbers
+// Regular C++ division truncates toward zero, but we need true floor division
+// Example: -5 / 3 = -2 (floor), not -1 (truncation)
+int floorDivision(int a, int b) {
+    int quotient = a / b;
+    int remainder = a % b;
+    // Adjust if remainder is nonzero and signs differ
+    if (remainder != 0 && ((a < 0) != (b < 0))) {
+        quotient--;
+    }
+    return quotient;
 }

@@ -26,7 +26,7 @@ int main(int argc, char* argv[]) {
     MeasurementSystem measurement(mode);
     
     BenchmarkParams params = BenchmarkParams::fromArgs(parser);
-    
+
     // Setup CKKS cryptocontext
     CCParams<CryptoContextCKKSRNS> ccParams;
     ccParams.SetMultiplicativeDepth(params.multDepth);

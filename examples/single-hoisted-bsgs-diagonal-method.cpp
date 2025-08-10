@@ -1,6 +1,5 @@
 // examples/single-hoisted-bsgs-diagonal-method.cpp - Hoisted BSGS diagonal method for matrix-vector multiplication
 #include <openfhe.h>
-#include <dram_counter.hpp>
 #include "utils.hpp"
 #include <iostream>
 #include <iomanip>
@@ -20,79 +19,51 @@
 
 using namespace lbcrypto;
 
-// Global DRAM counter
-static DRAMCounter g_dram_counter;
 
-// ============================================
-// HELPER FUNCTIONS FOR SIGNED INDEXING
-// ============================================
-
-// Convert diagonal index from [0, slots-1] to signed range [-slots/2, slots/2]
-// This treats the second half of slots as negative indices
-// Example: in 64 slots, index 63 becomes -1 (one step backwards)
-int normalizeToSignedIndex(int k, int numSlots) {
-    int halfSlots = numSlots / 2;
-    if (k <= halfSlots) {
-        return k;  // First half stays positive
-    } else {
-        return k - numSlots;  // Second half becomes negative
-    }
-}
-
-// Floor division that works correctly for negative numbers
-// Regular C++ division truncates toward zero, but we need true floor division
-// Example: -5 / 3 = -2 (floor), not -1 (truncation)
-int floorDivision(int a, int b) {
-    int quotient = a / b;
-    int remainder = a % b;
-    // Adjust if remainder is nonzero and signs differ
-    if (remainder != 0 && ((a < 0) != (b < 0))) {
-        quotient--;
-    }
-    return quotient;
-}
-
-int main() {
-    // Initialize DRAM counter
-    if (!g_dram_counter.init()) {
-        std::cerr << "Warning: DRAM measurements disabled\n";
-    }
-
-    // ============================================
-    // SETUP: Configure CKKS parameters
-    // ============================================
+int main(int argc, char* argv[]) {
+    // Parse arguments
+    ArgParser parser;
+    parser.parse(argc, argv);
     
-    uint32_t numLimbs     = 10;
-    uint32_t numDigits    = 2;
-    uint32_t scaleModSize = 50;
-    uint32_t ringDim      = 65536; 
-    std::size_t matrixDim = 128;  // Actual matrix dimension
-
-    CCParams<CryptoContextCKKSRNS> params;
-    params.SetMultiplicativeDepth(numLimbs - 1);
-    params.SetScalingModSize(scaleModSize);
-    params.SetRingDim(ringDim);
-    params.SetScalingTechnique(FIXEDMANUAL);
-    params.SetKeySwitchTechnique(HYBRID);
-    params.SetNumLargeDigits(numDigits);
-    params.SetSecurityLevel(HEStd_NotSet);
-
-    // Create cryptocontext
-    CryptoContext<DCRTPoly> cc = GenCryptoContext(params);
+    // Get parameters
+    bool quiet = parser.getBool("quiet", false);
+    bool skipVerify = parser.getBool("skip-verify", false);
+    std::size_t matrixDim = static_cast<std::size_t>(parser.getUInt32("matrix-dim", 128));
+    setupThreads(parser);
+    
+    MeasurementMode mode = parser.getMeasurementMode();
+    MeasurementSystem measurement(mode);
+    
+    BenchmarkParams params = BenchmarkParams::fromArgs(parser);
+    
+    // Setup CKKS cryptocontext
+    CCParams<CryptoContextCKKSRNS> ccParams;
+    ccParams.SetMultiplicativeDepth(params.multDepth);
+    ccParams.SetScalingModSize(50);
+    ccParams.SetRingDim(params.ringDim);
+    ccParams.SetScalingTechnique(FLEXIBLEAUTO);
+    ccParams.SetKeySwitchTechnique(HYBRID);
+    ccParams.SetNumLargeDigits(params.numDigits);
+    ccParams.SetSecurityLevel(params.checkSecurity ? HEStd_128_classic : HEStd_NotSet);
+    
+    CryptoContext<DCRTPoly> cc = GenCryptoContext(ccParams);
     cc->Enable(PKE);
     cc->Enable(KEYSWITCH);
     cc->Enable(LEVELEDSHE);
 
     int numSlots = static_cast<int>(cc->GetEncodingParams()->GetBatchSize());
     if (static_cast<int>(matrixDim) > numSlots) {
-        std::cerr << "Error: matrixDim must be <= numSlots\n";
+        std::cerr << "Error: matrixDim (" << matrixDim << ") must be <= numSlots (" << numSlots << ")\n";
         return 1;
     }
     
-    std::cout << "=== Single-Hoisted BSGS Method with On-Demand Key Loading ===\n";
-    std::cout << "Actual matrix dimension: " << matrixDim << "×" << matrixDim << "\n";
-    std::cout << "Number of slots: " << numSlots << "\n";
-    std::cout << "Ring dimension: " << ringDim << "\n\n";
+    if (!quiet) {
+        std::cout << "=== Single-Hoisted BSGS Method with On-Demand Key Loading ===\n";
+        std::cout << "Actual matrix dimension: " << matrixDim << "×" << matrixDim << "\n";
+        std::cout << "Number of slots: " << numSlots << "\n";
+        std::cout << "Ring dimension: " << params.ringDim << "\n";
+        std::cout << "Multiplicative depth: " << params.multDepth << "\n\n";
+    }
 
     // Generate key pair
     auto keyPair = cc->KeyGen();
@@ -101,18 +72,15 @@ int main() {
     // CREATE MATRIX AND VECTOR
     // ============================================
     
-    // Create embedded random matrix
+    // Create embedded random matrix and input vector
     auto M = make_embedded_random_matrix(matrixDim, numSlots);
-    print_matrix(M, matrixDim);
-    
-    // Create random input vector
     auto inputVec = make_random_input_vector(matrixDim, numSlots);
 
     // ============================================
     // EXTRACT DIAGONALS AND CONVERT TO SIGNED INDEXING
     // ============================================
     
-    std::cout << "Extracting diagonals...\n";
+    if (!quiet) std::cout << "Extracting diagonals...\n";
     
     // First extract diagonals with regular indexing [0, numSlots-1]
     auto diagonalsUnsigned = extract_generalized_diagonals(M, matrixDim);
@@ -128,9 +96,11 @@ int main() {
     }
     
     int numDiagonals = static_cast<int>(diagonalsSigned.size());
-    std::cout << "Found " << numDiagonals << " non-empty diagonals\n";
-    std::cout << "Diagonal indices range from " << diagonalsSigned.begin()->first 
-              << " to " << diagonalsSigned.rbegin()->first << "\n";
+    if (!quiet) {
+        std::cout << "Found " << numDiagonals << " non-empty diagonals\n";
+        std::cout << "Diagonal indices range from " << diagonalsSigned.begin()->first 
+                  << " to " << diagonalsSigned.rbegin()->first << "\n";
+    }
     
     // ============================================
     // BSGS PARAMETERS BASED ON ACTUAL DIAGONAL COUNT
@@ -147,14 +117,16 @@ int main() {
     // n2 is informational - we don't actually need it as a fixed bound
     int n2_approx = static_cast<int>(std::ceil(static_cast<double>(numSlots) / n1));
     
-    std::cout << "BSGS parameters: n1 = " << n1 
-              << " (based on sqrt(" << numDiagonals << ")), n2 ≈ " << n2_approx << "\n";
+    if (!quiet) {
+        std::cout << "BSGS parameters: n1 = " << n1 
+                  << " (based on sqrt(" << numDiagonals << ")), n2 ≈ " << n2_approx << "\n";
+    }
     
     // ============================================
     // DECOMPOSE DIAGONALS AND PRE-SHIFT
     // ============================================
     
-    std::cout << "Pre-shifting diagonals for BSGS decomposition...\n";
+    if (!quiet) std::cout << "Pre-shifting diagonals for BSGS decomposition...\n";
     
     // Track which baby steps (i) and giant steps (j) we actually use
     std::set<int> usedBabySteps;   // i ∈ [0, n1)
@@ -184,16 +156,28 @@ int main() {
         preshiftedDiagonals[k] = cc->MakeCKKSPackedPlaintext(diagonal);
     }
     
-    std::cout << "Baby steps used: " << usedBabySteps.size() 
-              << ", Giant steps used: " << usedGiantSteps.size() << "\n";
-    std::cout << "Giant step range: [" << *usedGiantSteps.begin() 
-              << ", " << *usedGiantSteps.rbegin() << "]\n";
+    if (!quiet) {
+        std::cout << "Baby steps used: " << usedBabySteps.size() 
+                  << ", Giant steps used: " << usedGiantSteps.size() << "\n";
+        std::cout << "Giant step range: [" << *usedGiantSteps.begin() 
+                  << ", " << *usedGiantSteps.rbegin() << "]\n";
+    }
+    
+    // ============================================
+    // CREATE TEMPORARY DIRECTORY FOR FILES
+    // ============================================
+    
+    TempDirectory tempDir;
+    if (!tempDir.isValid()) {
+        std::cerr << "Failed to create temporary directory" << std::endl;
+        return 1;
+    }
     
     // ============================================
     // GENERATE AND SAVE ROTATION KEYS INDIVIDUALLY
     // ============================================
     
-    std::cout << "Generating and saving rotation keys individually...\n";
+    if (!quiet) std::cout << "Generating and saving rotation keys individually...\n";
     
     // Collect all needed rotations
     std::set<int> rotationIndices;
@@ -216,9 +200,10 @@ int main() {
         cc->EvalRotateKeyGen(keyPair.secretKey, {rot});
         
         std::stringstream filename;
-        filename << "data/hoisted-bsgs-rot-key-" << rot << ".bin";
+        filename << "hoisted-bsgs-rot-key-" << rot << ".bin";
+        std::string keyPath = tempDir.getFilePath(filename.str());
         
-        std::ofstream keyFile(filename.str(), std::ios::binary);
+        std::ofstream keyFile(keyPath, std::ios::binary);
         if (!cc->SerializeEvalAutomorphismKey(keyFile, SerType::BINARY)) {
             std::cerr << "Failed to save rotation key " << rot << "\n";
             return 1;
@@ -227,18 +212,21 @@ int main() {
         cc->ClearEvalAutomorphismKeys();
     }
     
-    std::cout << "Generated and saved " << rotationIndices.size() << " rotation keys\n";
+    if (!quiet) {
+        std::cout << "Generated and saved " << rotationIndices.size() << " rotation keys\n";
+    }
     
     // ============================================
     // ENCRYPT AND SERIALIZE INPUT
     // ============================================
     
-    std::cout << "Encrypting and serializing input...\n";
+    if (!quiet) std::cout << "Encrypting and serializing input...\n";
     
     Plaintext inputPtxt = cc->MakeCKKSPackedPlaintext(inputVec);
     auto inputCipher = cc->Encrypt(keyPair.publicKey, inputPtxt);
     
-    if (!Serial::SerializeToFile("data/input.bin", inputCipher, SerType::BINARY)) {
+    std::string inputPath = tempDir.getFilePath("input.bin");
+    if (!Serial::SerializeToFile(inputPath, inputCipher, SerType::BINARY)) {
         std::cerr << "Failed to serialize input\n";
         return 1;
     }
@@ -249,24 +237,28 @@ int main() {
     // PROFILED HOISTED BSGS COMPUTATION WITH ON-DEMAND KEY LOADING
     // ============================================
     
-    std::cout << "\nStarting profiled hoisted BSGS computation with on-demand key loading...\n\n";
+    if (!quiet) {
+        std::cout << "\nStarting profiled hoisted BSGS computation with on-demand key loading...\n\n";
+    }
     
-    g_dram_counter.start();
+    // Start DRAM measurement
+    measurement.startDRAM();
     
     // Load input ciphertext
     Ciphertext<DCRTPoly> cipherInput;
-    if (!Serial::DeserializeFromFile("data/input.bin", cipherInput, SerType::BINARY)) {
+    if (!Serial::DeserializeFromFile(inputPath, cipherInput, SerType::BINARY)) {
         std::cerr << "Failed to load input\n";
         return 1;
     }
     
-    PIN_MARKER_START();
+    // PIN markers around the computation
+    measurement.startPIN();
     
     // === SINGLE-HOISTED BSGS WITH ON-DEMAND KEY LOADING ===
     
     // Step 1: Precompute rotation digits once (hoisting optimization)
     // This is the key hoisting step - shared by all baby rotations
-    std::cout << "Precomputing rotation digits for hoisting...\n";
+    if (!quiet) std::cout << "Precomputing rotation digits for hoisting...\n";
     auto precomputedDigits = cc->EvalFastRotationPrecompute(cipherInput);
     
     // Step 2: Get cyclotomic order (needed by EvalFastRotation)
@@ -285,9 +277,10 @@ int main() {
         if (!babyRotationComputed[i]) {
             // Load rotation key for this baby step
             std::stringstream filename;
-            filename << "data/hoisted-bsgs-rot-key-" << i << ".bin";
+            filename << "hoisted-bsgs-rot-key-" << i << ".bin";
+            std::string keyPath = tempDir.getFilePath(filename.str());
             
-            std::ifstream keyFile(filename.str(), std::ios::binary);
+            std::ifstream keyFile(keyPath, std::ios::binary);
             if (!cc->DeserializeEvalAutomorphismKey(keyFile, SerType::BINARY)) {
                 std::cerr << "Failed to load key for baby step " << i << "\n";
                 throw std::runtime_error("Missing rotation key");
@@ -350,9 +343,10 @@ int main() {
             
             // Load rotation key for this giant step
             std::stringstream filename;
-            filename << "data/hoisted-bsgs-rot-key-" << giantRotation << ".bin";
+            filename << "hoisted-bsgs-rot-key-" << giantRotation << ".bin";
+            std::string keyPath = tempDir.getFilePath(filename.str());
             
-            std::ifstream keyFile(filename.str(), std::ios::binary);
+            std::ifstream keyFile(keyPath, std::ios::binary);
             if (!cc->DeserializeEvalAutomorphismKey(keyFile, SerType::BINARY)) {
                 std::cerr << "Failed to load key for giant step " << giantRotation << "\n";
                 return 1;
@@ -375,32 +369,35 @@ int main() {
         }
     }
     
-    // Final rescale to manage noise
-    result = cc->Rescale(result);
-    
-    PIN_MARKER_END();
+    measurement.endPIN();
     
     // Save result
-    if (!Serial::SerializeToFile("data/result.bin", result, SerType::BINARY)) {
+    std::string resultPath = tempDir.getFilePath("result.bin");
+    if (!Serial::SerializeToFile(resultPath, result, SerType::BINARY)) {
         std::cerr << "Failed to save result\n";
         return 1;
     }
     
-    g_dram_counter.stop();
-    g_dram_counter.print_results(true);
+    // Stop DRAM measurement
+    measurement.stopDRAM();
+    
+    // Print measurement results
+    measurement.printResults();
     
     // ============================================
     // VERIFICATION
     // ============================================
     
-    std::cout << "\nDecrypting and verifying result...\n";
-    
-    Plaintext resultPtxt;
-    cc->Decrypt(keyPair.secretKey, result, &resultPtxt);
-    resultPtxt->SetLength(numSlots);
-    
-    auto resultVec = resultPtxt->GetRealPackedValue();
-    verify_matrix_vector_result(resultVec, M, inputVec, matrixDim);
+    if (!skipVerify) {
+        if (!quiet) std::cout << "\nDecrypting and verifying result...\n";
+        
+        Plaintext resultPtxt;
+        cc->Decrypt(keyPair.secretKey, result, &resultPtxt);
+        resultPtxt->SetLength(numSlots);
+        
+        auto resultVec = resultPtxt->GetRealPackedValue();
+        verify_matrix_vector_result(resultVec, M, inputVec, matrixDim, quiet);
+    }
 
     return 0;
 }

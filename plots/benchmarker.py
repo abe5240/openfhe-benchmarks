@@ -9,6 +9,7 @@ Provides comprehensive performance analysis including:
 """
 
 import json
+import re
 import os
 import subprocess
 import time
@@ -131,14 +132,14 @@ class Benchmarker:
             str(target),
             *args,
             "--measure=none",
-            "--quiet=true",
             "--skip-verify=true"
         ]
         
         times = []
         for _ in range(runs):
             start = time.perf_counter()
-            result = subprocess.run(cmd, capture_output=True)
+            # Don't capture output - let the quiet flag control visibility
+            result = subprocess.run(cmd, stderr=subprocess.DEVNULL)
             
             if result.returncode == 0:
                 elapsed = time.perf_counter() - start
@@ -147,7 +148,7 @@ class Benchmarker:
         if not times:
             return (None, None)
             
-        return (mean(times), stdev(times))
+        return (mean(times), stdev(times) if len(times) > 1 else 0.0)
     
     def measure_dram(self, target, args):
         """
@@ -165,7 +166,6 @@ class Benchmarker:
             str(target),
             *args,
             "--measure=dram",
-            "--quiet=true",
             "--skip-verify=true"
         ]
         
@@ -181,18 +181,11 @@ class Benchmarker:
                 key, value = line.split('=', 1)
                 data[key] = int(value)
         
-        return data
+        return data if data else None
     
     def measure_opcounts(self, target, args):
         """
         Measure integer operations using Intel PIN instrumentation.
-        
-        Args:
-            target: Path to the executable
-            args: Command line arguments
-            
-        Returns:
-            Dictionary with operation counts, or None on failure
         """
         cmd = [
             "sudo", "-n",
@@ -202,7 +195,6 @@ class Benchmarker:
             str(target),
             *args,
             "--measure=pin",
-            "--quiet=true",
             "--skip-verify=true"
         ]
         
@@ -211,11 +203,15 @@ class Benchmarker:
         if result.returncode != 0:
             return None
         
-        # Parse JSON output from PIN tool
-        try:
-            return json.loads(result.stdout.strip())
-        except (json.JSONDecodeError, ValueError):
-            return None
+        # Extract JSON from output (it might have other text around it)
+        json_match = re.search(r'\{[^}]+\}', result.stdout)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except (json.JSONDecodeError, ValueError):
+                pass
+        
+        return None
     
     # ============================================================================
     # Main Execution
